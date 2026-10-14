@@ -1,0 +1,74 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d9ddf44..7de5dbd 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -19,6 +19,8 @@
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
++#include <cstdint>
++#include <limits>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -1825,6 +1827,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
++
++    // The target and draft K/V state alone is insufficient at a prompt-cache
++    // boundary: process() carries the final target hidden-state row here so
++    // the next batch can pair it with its first token.  Preserve that compact
++    // per-sequence row through the existing common_speculative state API.
++    static constexpr std::uint32_t kMtpPromptCacheStateMagic = 0x4d545043u; // MTPC
++    static constexpr std::uint32_t kMtpPromptCacheStateVersion = 1u;
++
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
++            return false;
++        }
++        const auto & h = pending_h[seq_id];
++        if (h.size() != static_cast<size_t>(n_embd) ||
++            h.size() > (std::numeric_limits<size_t>::max() - 3 * sizeof(std::uint32_t)) / sizeof(float)) {
++            return false;
++        }
++
++        constexpr size_t kHeaderBytes = 3 * sizeof(std::uint32_t);
++        const size_t payload_bytes = h.size() * sizeof(float);
++        data.resize(kHeaderBytes + payload_bytes);
++        const std::uint32_t n_embd_u32 = static_cast<std::uint32_t>(n_embd);
++        std::memcpy(data.data(), &kMtpPromptCacheStateMagic, sizeof(kMtpPromptCacheStateMagic));
++        std::memcpy(data.data() + sizeof(std::uint32_t), &kMtpPromptCacheStateVersion,
++                    sizeof(kMtpPromptCacheStateVersion));
++        std::memcpy(data.data() + 2 * sizeof(std::uint32_t), &n_embd_u32, sizeof(n_embd_u32));
++        std::memcpy(data.data() + kHeaderBytes, h.data(), payload_bytes);
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_embd <= 0) {
++            return;
++        }
++        constexpr size_t kHeaderBytes = 3 * sizeof(std::uint32_t);
++        const auto & h = pending_h[seq_id];
++        if (h.size() != static_cast<size_t>(n_embd) ||
++            h.size() > (std::numeric_limits<size_t>::max() - kHeaderBytes) / sizeof(float) ||
++            data.size() != kHeaderBytes + h.size() * sizeof(float)) {
++            return;
++        }
++
++        std::uint32_t magic = 0;
++        std::uint32_t version = 0;
++        std::uint32_t saved_n_embd = 0;
++        std::memcpy(&magic, data.data(), sizeof(magic));
++        std::memcpy(&version, data.data() + sizeof(std::uint32_t), sizeof(version));
++        std::memcpy(&saved_n_embd, data.data() + 2 * sizeof(std::uint32_t), sizeof(saved_n_embd));
++        if (magic != kMtpPromptCacheStateMagic || version != kMtpPromptCacheStateVersion ||
++            saved_n_embd != static_cast<std::uint32_t>(n_embd)) {
++            return;
++        }
++        std::memcpy(pending_h[seq_id].data(), data.data() + kHeaderBytes, h.size() * sizeof(float));
++    }
+ };
+ 
+ // state of self-speculation (simple implementation, not ngram-map)

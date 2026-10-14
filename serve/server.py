@@ -3669,10 +3669,11 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True):
+                 fit_max_tokens: bool = True, max_output_tokens: int | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
+        self.max_output_tokens = max_output_tokens    # an optional model-wide completion ceiling
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -4463,7 +4464,8 @@ class Service:
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
-        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+        engine = {"model": self.model, "max_context": self.reported_ctx(),
+                  "max_output_tokens": self.max_output_tokens, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
@@ -4526,7 +4528,7 @@ class Service:
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
         return {
-            "service": "strata", "model": self.model,
+            "service": "strata", "model": self.model, "max_output_tokens": self.max_output_tokens,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -4718,18 +4720,21 @@ class Service:
                 raise ValueError("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
-            max_new = room
+            max_new = min(room, self.max_output_tokens) if self.max_output_tokens else room
         elif max_new > room:
-            if not self.fit_max_tokens:
-                self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
-            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
-                  f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
-            max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+            if self.max_output_tokens and max_new > self.max_output_tokens:
+                max_new = self.max_output_tokens
+            if max_new > room:
+                if not self.fit_max_tokens:
+                    self.forget_prompt(encoded_ids)
+                    raise ValueError("request exceeds the context window: "
+                                     f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                     f"({ctx}); requests are never truncated. Send a smaller "
+                                     f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                     "model's strata-<model>.json to shorten it to the room left (#545)")
+                print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
+                      f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
+                max_new = max(1, room)          # a shorter completion beats a 400 (the default)
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -6420,7 +6425,8 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
-                self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
+                self._json(200, {"status": "ok", "max_context": svc.reported_ctx(),
+                                  "max_output_tokens": svc.max_output_tokens, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
@@ -6455,7 +6461,11 @@ def make_handler(svc: Service):
                 if self._authorized():
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.reported_ctx()},
+                             "meta": {"n_ctx": svc.reported_ctx(),
+                                      "max_output_tokens": svc.max_output_tokens},
+                             "context_length": svc.reported_ctx(),
+                             "context_window": svc.reported_ctx(),
+                             "max_output_tokens": svc.max_output_tokens,
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
@@ -6731,7 +6741,10 @@ def make_handler(svc: Service):
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
-            params["n_predict"] = svc.shared.get("max_tokens", -1)
+            n_predict = svc.shared.get("max_tokens", svc.max_output_tokens or -1)
+            if svc.max_output_tokens and isinstance(n_predict, int) and n_predict > 0:
+                n_predict = min(n_predict, svc.max_output_tokens)
+            params["n_predict"] = n_predict
             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
@@ -8207,10 +8220,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    output_cap = cfg.get("max_output_tokens")
+    if output_cap is not None and (isinstance(output_cap, bool) or not isinstance(output_cap, int) or output_cap < 1):
+        ap.error('config max_output_tokens must be a positive integer when set')
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False),
+                  max_output_tokens=output_cap)
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
     svc.max_queue = max_queue

@@ -57,6 +57,9 @@ Terminal cannot run. Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.m
   the packages and the update feed: [packaging/README.md](packaging/README.md) and [packaging/UPDATES.md](packaging/UPDATES.md).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md);
   Mac (Metal): [docs/MAC.md](docs/MAC.md).
+- DGX Spark / GB10 (`sm_121`) work: the approved merge plan [docs/DGX_SPARK_MERGE_PLAN.md](docs/DGX_SPARK_MERGE_PLAN.md)
+  and the review checklist [docs/DGX_SPARK_PLAN_REVIEW.md](docs/DGX_SPARK_PLAN_REVIEW.md). No code has been written from
+  them yet; the plan's phases start only on the owner's go.
 - Tests: the Terminal and Control tests are in `tests/terminal` (`python -m pytest tests/terminal`). The app's UI
   tests run with `npm test` in `apps/host`. Setup's own tests run without a GPU or downloads:
   `python tools/test_setup_<name>.py` (for example `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).

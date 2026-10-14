@@ -10,11 +10,14 @@
 //      end unpadded (unsloth's UD-Q5_K_XL shard 1 ends 6 bytes before its aligned data start; llama.cpp's
 //      gguf-py reads it); nothing is ever read from its data section.
 //   4. one tensor, and the file ends at its header: still refused at open ("data section starts past EOF").
+//   5. the qwen35moe admission gate: the exact Qwen3.6 35B-A3B metadata contract is accepted, and
+//   6. an incompatible MTP depth (qwen35moe.nextn_predict_layers) is refused.
 //
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
 // alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
 // on Windows an open mapping keeps it.
 #include "strata/artifact/gguf_reader.hpp"
+#include "../../tests/core/gguf_fixture.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -123,6 +126,73 @@ int main() {
         std::filesystem::remove(path);
         check(err.find("data section starts past EOF") != std::string::npos,
               "one tensor, ends before the aligned data start: refused at open");
+    }
+    {
+        const auto path = std::filesystem::temp_directory_path() / "strata_qwen35moe_guard_test.gguf";
+        const std::vector<fixture::Kv> kv = {
+            fixture::str("general.architecture", "qwen35moe"),
+            fixture::u32("qwen35moe.block_count", 41),
+            fixture::u32("qwen35moe.embedding_length", 2048),
+            fixture::u32("qwen35moe.expert_count", 256),
+            fixture::u32("qwen35moe.expert_used_count", 8),
+            fixture::u32("qwen35moe.attention.head_count", 16),
+            fixture::u32("qwen35moe.attention.head_count_kv", 2),
+            fixture::u32("qwen35moe.attention.key_length", 256),
+            fixture::u32("qwen35moe.attention.value_length", 256),
+            fixture::u32("qwen35moe.expert_feed_forward_length", 512),
+            fixture::u32("qwen35moe.expert_shared_feed_forward_length", 512),
+            fixture::u32("qwen35moe.ssm.conv_kernel", 4),
+            fixture::u32("qwen35moe.ssm.state_size", 128),
+            fixture::u32("qwen35moe.ssm.group_count", 16),
+            fixture::u32("qwen35moe.ssm.time_step_rank", 32),
+            fixture::u32("qwen35moe.ssm.inner_size", 4096),
+            fixture::u32("qwen35moe.full_attention_interval", 4),
+            fixture::u32("qwen35moe.nextn_predict_layers", 1),
+        };
+        fixture::write(path, kv, {});
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+            err = strata::check_qwen35moe_architecture(g);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.empty(), "Qwen3.6 qwen35moe contract: exact 35B-A3B metadata is accepted");
+    }
+    {
+        const auto path = std::filesystem::temp_directory_path() / "strata_qwen35moe_guard_reject_test.gguf";
+        const std::vector<fixture::Kv> kv = {
+            fixture::str("general.architecture", "qwen35moe"),
+            fixture::u32("qwen35moe.block_count", 41),
+            fixture::u32("qwen35moe.embedding_length", 2048),
+            fixture::u32("qwen35moe.expert_count", 256),
+            fixture::u32("qwen35moe.expert_used_count", 8),
+            fixture::u32("qwen35moe.attention.head_count", 16),
+            fixture::u32("qwen35moe.attention.head_count_kv", 2),
+            fixture::u32("qwen35moe.attention.key_length", 256),
+            fixture::u32("qwen35moe.attention.value_length", 256),
+            fixture::u32("qwen35moe.expert_feed_forward_length", 512),
+            fixture::u32("qwen35moe.expert_shared_feed_forward_length", 512),
+            fixture::u32("qwen35moe.ssm.conv_kernel", 4),
+            fixture::u32("qwen35moe.ssm.state_size", 128),
+            fixture::u32("qwen35moe.ssm.group_count", 16),
+            fixture::u32("qwen35moe.ssm.time_step_rank", 32),
+            fixture::u32("qwen35moe.ssm.inner_size", 4096),
+            fixture::u32("qwen35moe.full_attention_interval", 4),
+            fixture::u32("qwen35moe.nextn_predict_layers", 2),
+        };
+        fixture::write(path, kv, {});
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+            err = strata::check_qwen35moe_architecture(g);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.find("qwen35moe.nextn_predict_layers") != std::string::npos,
+              "Qwen3.6 qwen35moe contract: incompatible MTP depth is refused");
     }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

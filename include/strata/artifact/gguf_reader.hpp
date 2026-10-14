@@ -846,4 +846,68 @@ inline std::string check_engine_architecture(const GgufFile& g) {
     return model_family_not_supported(model_family(g));
 }
 
+// Qwen 3.6 35B-A3B is a qwen35moe model.  It shares the gated-delta-net and
+// routed-MoE concepts with Qwen4Exp, but it is not the same tensor contract:
+// there is no PLE or hyperconnection stack, attention is every fourth block,
+// and the MTP block is stored as the final GGUF block.  Keep this guard
+// separate from Qwen4Exp rather than weakening check_architecture(): accepting
+// the wrong family would make the specialised kernels return plausible but
+// incorrect logits.
+struct Qwen35MoeGuard {
+    uint32_t block_count = 41;
+    uint32_t hidden = 2048;
+    uint32_t experts = 256;
+    uint32_t experts_used = 8;
+    uint32_t head_count = 16;
+    uint32_t head_count_kv = 2;
+    uint32_t key_length = 256;
+    uint32_t value_length = 256;
+    uint32_t expert_ffn = 512;
+    uint32_t shared_expert_ffn = 512;
+    uint32_t ssm_conv_kernel = 4;
+    uint32_t ssm_state_size = 128;
+    uint32_t ssm_group_count = 16;
+    uint32_t ssm_time_step_rank = 32;
+    uint32_t ssm_inner_size = 4096;
+    uint32_t full_attention_interval = 4;
+    uint32_t mtp_layers = 1;
+};
+
+inline std::string check_qwen35moe_architecture(const GgufFile& g, const Qwen35MoeGuard& want = {}) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "qwen35moe")
+        return "architecture is '" + arch->s + "', this adapter requires 'qwen35moe'";
+    struct Req {
+        const char* key;
+        uint64_t want;
+    };
+    const Req reqs[] = {
+        {"qwen35moe.block_count", want.block_count},
+        {"qwen35moe.embedding_length", want.hidden},
+        {"qwen35moe.expert_count", want.experts},
+        {"qwen35moe.expert_used_count", want.experts_used},
+        {"qwen35moe.attention.head_count", want.head_count},
+        {"qwen35moe.attention.head_count_kv", want.head_count_kv},
+        {"qwen35moe.attention.key_length", want.key_length},
+        {"qwen35moe.attention.value_length", want.value_length},
+        {"qwen35moe.expert_feed_forward_length", want.expert_ffn},
+        {"qwen35moe.expert_shared_feed_forward_length", want.shared_expert_ffn},
+        {"qwen35moe.ssm.conv_kernel", want.ssm_conv_kernel},
+        {"qwen35moe.ssm.state_size", want.ssm_state_size},
+        {"qwen35moe.ssm.group_count", want.ssm_group_count},
+        {"qwen35moe.ssm.time_step_rank", want.ssm_time_step_rank},
+        {"qwen35moe.ssm.inner_size", want.ssm_inner_size},
+        {"qwen35moe.full_attention_interval", want.full_attention_interval},
+        {"qwen35moe.nextn_predict_layers", want.mtp_layers},
+    };
+    for (const auto& r : reqs) {
+        const MetaValue* v = g.get(r.key);
+        if (!v) return std::string("missing ") + r.key;
+        if (v->u != r.want)
+            return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+    }
+    return {};
+}
+
 } // namespace strata

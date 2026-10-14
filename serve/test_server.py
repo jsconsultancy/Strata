@@ -4926,6 +4926,49 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class ModelCapabilityContract(unittest.TestCase):
+    """A local client can discover the context and shared completion ceiling without model-specific rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name="physical-model",
+                          max_output_tokens=17)
+        cls.svc.set_aliases(["strata-local-active"])
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def test_catalogue_advertises_the_capability_contract(self):
+        with urllib.request.urlopen(self.base + "/v1/models", timeout=30) as r:
+            data = json.loads(r.read())["data"]
+        for model in data:
+            self.assertEqual(model["context_length"], CTX)
+            self.assertEqual(model["context_window"], CTX)
+            self.assertEqual(model["max_output_tokens"], 17)
+            self.assertEqual(model["meta"]["max_output_tokens"], 17)
+
+    def test_cap_limits_explicit_and_unbounded_requests(self):
+        messages = [{"role": "user", "content": "hi"}]
+        self.assertEqual(self.svc.prepare(messages, None, {}, 99)[2], 17)
+        self.assertEqual(self.svc.prepare(messages, None, {}, 0)[2], 17)
+
+    def test_props_never_advertises_an_unenforceable_shared_default(self):
+        previous = self.svc.shared
+        self.svc.shared = {"max_tokens": 99}
+        try:
+            with urllib.request.urlopen(self.base + "/props", timeout=30) as r:
+                props = json.loads(r.read())
+            self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], 17)
+        finally:
+            self.svc.shared = previous
+
+
 class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""

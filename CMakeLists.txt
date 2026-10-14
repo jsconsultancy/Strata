@@ -261,6 +261,18 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
+# Exact Qwen3.6-35B-A3B GGUF admission gate. This has no GPU dependency and
+# is intentionally separate from the Qwen4Exp reader check while the native
+# execution adapter is being brought up.
+add_executable(strata-qwen35moe-preflight src/artifact/qwen35moe_preflight.cpp)
+target_link_libraries(strata-qwen35moe-preflight PRIVATE strata_artifact)
+if(MSVC)
+  # The mmap reader reports failures with C++ exceptions.  Keep unwind semantics
+  # explicit on the standalone admission utility rather than relying on an IDE
+  # default (and avoid C4530 masking real diagnostics).
+  target_compile_options(strata-qwen35moe-preflight PRIVATE /EHsc)
+endif()
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
@@ -276,6 +288,18 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # Qwen3.6's layout is a distinct architecture contract from the existing
+  # Qwen4Exp engine.  Keep its descriptor/schedule unit test in the normal
+  # CPU-only CTest path so a future native executor cannot accidentally
+  # regress its DeltaNet, attention, or MTP binding rules.
+  add_executable(qwen35moe_layout_test
+    tests/core/qwen35moe_layout_test.cpp
+    src/core/qwen35moe_layout.cpp)
+  target_link_libraries(qwen35moe_layout_test PRIVATE strata_artifact)
+  if(MSVC)
+    target_compile_options(qwen35moe_layout_test PRIVATE /EHsc)
+  endif()
+  add_test(NAME qwen35moe_layout_test COMMAND qwen35moe_layout_test)
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
