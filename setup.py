@@ -2798,6 +2798,13 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     return f"{folder} has no {fam['title']} {model} file", hint
 
 
+# --skip-gguf-sha256: install a model file that is not the pinned build - Huihui's abliterated shards, a
+# re-quantization, a repository that moved its file after this pin - so neither its size nor its SHA-256 is compared.
+# The ready-made engine keeps its own switch (STRATA_SKIP_SHA256, check_engine_digest); this one is about the GGUFs.
+# Set in main(); only the model files' verify_sha256 calls pass it.
+SKIP_GGUF_SHA256 = False
+
+
 def _hash_file(s: Path, size: int) -> str:
     h = hashlib.sha256()
     seen, last = 0, 0.0
@@ -2816,13 +2823,21 @@ def _hash_file(s: Path, size: int) -> str:
     return h.hexdigest()
 
 
-def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) -> None:
+def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, skip: bool = False) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
     so the ~5 minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again.
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
-    piece by piece and only the damaged pieces are written again, then it is checked a second time."""
+    piece by piece and only the damaged pieces are written again, then it is checked a second time.
+    skip (--skip-gguf-sha256, a model file of another build) compares neither: the mark then holds the size on disk
+    instead of a pinned SHA-256, so a later run without the flag hashes the file again."""
     m = s.with_name(s.name + ".done")
     if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
+        return
+    if skip:
+        have = s.stat().st_size if s.exists() else -1
+        warn(f"--skip-gguf-sha256: {s.name} is NOT checked ({have:,} bytes on disk; the pinned file is {size:,} "
+             f"bytes, SHA-256 {sha[:12]}...). A corrupt or different file is used as it is.")
+        mark(s, f"sha256 skipped ({have:,} bytes)")
         return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
@@ -2930,7 +2945,7 @@ def ready_fetch(model: str, models_dir: Path) -> None:
             except OSError:
                 pass                                   # another drive: downloaded
         download(f"{hf_endpoint()}/{f[1]}/resolve/{f[2]}/{f[3]}", dst, f"{f[1].split('/')[-1]}: {f[3]}")
-        verify_sha256(dst, size, sha)
+        verify_sha256(dst, size, sha, SKIP_GGUF_SHA256)
 
 
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
@@ -7457,7 +7472,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
+    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir), skip=SKIP_GGUF_SHA256)
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
@@ -7467,7 +7482,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             if a.gguf_dir:
                 fail(f"{mmproj} is missing", f"put {mmproj.name} in {folder}, or drop --gguf-dir to download it")
             download(fam["mmproj_hf"] + mmproj.name, mmproj, "vision encoder")
-        verify_sha256(mmproj, *fam["sha256"][mmproj.name], own=bool(a.gguf_dir))
+        verify_sha256(mmproj, *fam["sha256"][mmproj.name], own=bool(a.gguf_dir), skip=SKIP_GGUF_SHA256)
         ok(f"vision encoder: {mmproj}")
 
     step(6, "preparing the model for Strata")
@@ -7583,7 +7598,7 @@ def preview_family(a) -> int:
     for f in files:
         url = (fam["mmproj_hf"] if f.name == fam["mmproj"] else fam["hf"]) + f.name
         download(url, f, "vision encoder" if f.name == fam["mmproj"] else None)
-        verify_sha256(f, *fam["sha256"][f.name])
+        verify_sha256(f, *fam["sha256"][f.name], SKIP_GGUF_SHA256)
     ok(f"{fam['title']} {model}: {folder}")
     say()
     say(f"{fam['title']} is downloaded, but this Strata version cannot run it yet (its engine path is in "
@@ -7870,6 +7885,11 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--skip-gguf-sha256", action="store_true",
+                    help="do not check the model files against the size and SHA-256 pinned in setup.py, so another "
+                         "build of the same model works too (an abliterated or re-quantized GGUF, a repository that "
+                         "moved its file).  The files are still checked for being whole.  The ready-made engine is "
+                         "checked either way (that one is skipped with STRATA_SKIP_SHA256=1)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -7931,6 +7951,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    global SKIP_GGUF_SHA256                              # the model files only, not the engine archive
+    SKIP_GGUF_SHA256 = a.skip_gguf_sha256
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in PREVIEW_FAMILIES.items()
                                                               if a.model in d["models"]))
@@ -8680,7 +8702,7 @@ def main() -> int:
         check_shards(shards)
     for s in ([] if ready else shards):                # the Unsloth files: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))
+            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir), skip=SKIP_GGUF_SHA256)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam.get("mmproj", MMPROJ)
     if not mmproj.exists():                            # an earlier install's copy (the same file for every family)
@@ -8691,7 +8713,7 @@ def main() -> int:
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
-            verify_sha256(mmproj, *fam["mmproj_sha256"])
+            verify_sha256(mmproj, *fam["mmproj_sha256"], SKIP_GGUF_SHA256)
         ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
