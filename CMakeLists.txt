@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -300,6 +300,10 @@ if(STRATA_BUILD_TESTS)
     target_compile_options(qwen35moe_layout_test PRIVATE /EHsc)
   endif()
   add_test(NAME qwen35moe_layout_test COMMAND qwen35moe_layout_test)
+  # Exercise the CLI's return codes on synthetic GGUFs, including wrapped offsets and tensor sizes.
+  add_executable(gguf_cli_test tests/core/gguf_cli_test.cpp)
+  target_link_libraries(gguf_cli_test PRIVATE strata_artifact)
+  add_test(NAME gguf_cli_test COMMAND gguf_cli_test)
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
