@@ -115,6 +115,9 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 100:   // ds4's MXFP8 (the NVFP4-QAD GGUF); not an official ggml id, no kernels - see
+                // tools/qad_dense_convert.py, which decodes it before the engine sees the weights
+        return "MXFP8";
     // Agention's llama.cpp fork: the APR trellis expert types (docs/GYRO.md)
     case 143:
         return "PTQ1_0";
@@ -233,6 +236,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 100:   // ds4's MXFP8: four UE8M0 scales (one per 32 values) + 128 E4M3 codes per 128 values
+        elems = 128;
+        bytes = 132;
         return true;
     // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
     // PTQ1_0 = 26 B of base-3 digits + fp16 scale
