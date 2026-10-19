@@ -1686,8 +1686,10 @@ struct Engine {
                 CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
                               cudaMemcpyHostToDevice));
             }
-            for (const auto& tb : {std::pair<void***, std::vector<void*>*>{&d_kc_tab, &hk},
-                                   {&d_vc_tab, &hv}}) {
+            // nvcc 12.6 cannot deduce the range of a braced-init-list in a range-for (upstream builds with
+            // CUDA 13); the same two entries as a named array, the shape of `tabs` above.
+            const std::pair<void***, std::vector<void*>*> ktabs[2] = {{&d_kc_tab, &hk}, {&d_vc_tab, &hv}};
+            for (const auto& tb : ktabs) {
                 CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(void*)));
                 CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(void*),
                               cudaMemcpyHostToDevice));
