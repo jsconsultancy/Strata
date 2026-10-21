@@ -4749,7 +4749,7 @@ class Service:
                                  f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
             max_new = min(room, self.max_output_tokens) if self.max_output_tokens else room
-        elif max_new > room:
+        elif max_new > room or (self.max_output_tokens and max_new > self.max_output_tokens):
             if self.max_output_tokens and max_new > self.max_output_tokens:
                 max_new = self.max_output_tokens
             if max_new > room:
