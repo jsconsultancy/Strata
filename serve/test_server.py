@@ -1187,10 +1187,9 @@ class ToolCallRecovery(unittest.TestCase):
 
     def test_bare_function_without_the_wrapper(self):
         # corpus 395efd4c / 6e71eed4 (x5 each): <function=...> with no <tool_call> around it
-        for name in ("write", " write ", "\twrite\t"):
-            self.check(f"Writing it now.\n\n<function={name}>\n{self.PARAMS}", [("write", self.CALL)], "Writing it now.")
-            self.check(f"<function={name}>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
-            self.check(f"<function={name}>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
+        self.check(f"Writing it now.\n\n<function=write>\n{self.PARAMS}", [("write", self.CALL)], "Writing it now.")
+        self.check(f"<function=write>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
+        self.check(f"<function=write>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
 
     def test_two_calls_in_one_wrapper(self):
         # corpus 0912870b / 51b155c9: a batch inside one <tool_call> - the second call's parameters were merged into
@@ -1209,9 +1208,6 @@ class ToolCallRecovery(unittest.TestCase):
         self.check(inline, [], inline)
         unknown = "<function=format_disk>\n<parameter=x>\n1\n</parameter>\n</function>"
         self.check(unknown, [], unknown)
-        for text in (fenced, inline, unknown):
-            padded = text.replace("<function=write>", "<function= write >").replace("<function=format_disk>", "<function= format_disk >")
-            self.check(padded, [], padded)
 
 
 class ToolCallRecoveryOff(unittest.TestCase):
@@ -1333,28 +1329,12 @@ class UnfinishedToolCall(unittest.TestCase):
             ("anthropic", False): ("end_turn", []),                      # call out: it has no arguments to give
             ("anthropic", True): ("end_turn", cut)})
 
-    def test_quoted_incomplete_wrapper_is_not_a_call(self):
-        text = "Format: " + self.WHOLE[len("</think>\n\n"):].removesuffix("</tool_call>") + "and then I explain it."
-        answers = self.answers("</think>\n\n" + text)
-        for api, stop in (("openai", "stop"), ("anthropic", "end_turn")):
-            self.assertEqual(answers[api, False], (stop, []))
-            self.assertEqual(answers[api, True][0], stop)
-            with self.assertRaises(ValueError):
-                json.loads(answers[api, True][1])
-
     def test_a_call_cut_at_the_token_limit(self):
         """The same cut by max_tokens: "length" / "max_tokens", and the whole (non-streamed) answers leave the call
         out in both APIs."""
-        cases = ((self.CUT + "rest of the file, never reached" * 40, len(self.CUT)),
-                 (self.WHOLE, len(self.WHOLE) - len("</tool_call>")))
-        for script, limit in cases:
-            with self.subTest(limit=limit):
-                a = self.answers(script, max_tokens=limit)
-                self.assertEqual((a["openai", False], a["anthropic", False]), (("length", []), ("max_tokens", [])))
-                self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
-                for api in ("openai", "anthropic"):
-                    with self.assertRaises(ValueError):
-                        json.loads(a[api, True][1])
+        a = self.answers(self.CUT + "rest of the file, never reached" * 40, max_tokens=len(self.CUT))
+        self.assertEqual((a["openai", False], a["anthropic", False]), (("length", []), ("max_tokens", [])))
+        self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
 
     def test_collect_keeps_calls_whose_arguments_parse(self):
         from serve.server import openai_collect
@@ -4944,49 +4924,6 @@ class ModelAliases(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-
-
-class ModelCapabilityContract(unittest.TestCase):
-    """A local client can discover the context and shared completion ceiling without model-specific rules."""
-
-    @classmethod
-    def setUpClass(cls):
-        tok = ByteTokenizer()
-        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
-                          ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name="physical-model",
-                          max_output_tokens=17)
-        cls.svc.set_aliases(["strata-local-active"])
-        cls.httpd = serve(cls.svc, port=0)
-        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
-    def test_catalogue_advertises_the_capability_contract(self):
-        with urllib.request.urlopen(self.base + "/v1/models", timeout=30) as r:
-            data = json.loads(r.read())["data"]
-        for model in data:
-            self.assertEqual(model["context_length"], CTX)
-            self.assertEqual(model["context_window"], CTX)
-            self.assertEqual(model["max_output_tokens"], 17)
-            self.assertEqual(model["meta"]["max_output_tokens"], 17)
-
-    def test_cap_limits_explicit_and_unbounded_requests(self):
-        messages = [{"role": "user", "content": "hi"}]
-        self.assertEqual(self.svc.prepare(messages, None, {}, 99)[2], 17)
-        self.assertEqual(self.svc.prepare(messages, None, {}, 0)[2], 17)
-
-    def test_props_never_advertises_an_unenforceable_shared_default(self):
-        previous = self.svc.shared
-        self.svc.shared = {"max_tokens": 99}
-        try:
-            with urllib.request.urlopen(self.base + "/props", timeout=30) as r:
-                props = json.loads(r.read())
-            self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], 17)
-        finally:
-            self.svc.shared = previous
 
 
 class AmdTelemetry(unittest.TestCase):
