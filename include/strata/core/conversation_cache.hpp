@@ -234,6 +234,8 @@ inline bool parse_conversation_cache_min_tokens(std::string_view text, Conversat
 /// batch slots and searches nothing (so it restores nothing).  0 = no limit, the pre-READ behaviour.
 inline bool conversation_cache_should_read_parked(int64_t prompt_tokens, int64_t read_min_tokens) {
     return read_min_tokens <= 0 || prompt_tokens >= read_min_tokens;
+}
+
 /// Phase 3b: longest common PREFIX of a checkpoint and a prompt, up to the checkpoint's length.
 /// Returns:
 ///   0:  no LCP (token 0 mismatches, or image key mismatch below the LCP, or empty checkpoint)
