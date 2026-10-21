@@ -1510,11 +1510,14 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
     # (PROT_NONE faults on any host deref, exactly as a discrete-GPU address would).
     # CPU-only: the test supplies a fake-cuda API in its own TU; no <cuda_runtime.h>.
     # RED->GREEN: removing the transport from kv_splice_transport.hpp makes this SEGV.
-    add_executable(suffix_reuse_device_test src/program/suffix_reuse_device_test.cpp)
-    target_include_directories(suffix_reuse_device_test PRIVATE include)
-    target_compile_definitions(suffix_reuse_device_test PRIVATE
-      STRATA_SPLICE_TRANSPORT=1 STRATA_SPLICE_FAKE_CUDA=1)
-    add_test(NAME suffix_reuse_device_test COMMAND suffix_reuse_device_test)
+    # The fake device mmaps its backing file: POSIX only (sys/mman.h), so not on Windows.
+    if(NOT WIN32)
+      add_executable(suffix_reuse_device_test src/program/suffix_reuse_device_test.cpp)
+      target_include_directories(suffix_reuse_device_test PRIVATE include)
+      target_compile_definitions(suffix_reuse_device_test PRIVATE
+        STRATA_SPLICE_TRANSPORT=1 STRATA_SPLICE_FAKE_CUDA=1)
+      add_test(NAME suffix_reuse_device_test COMMAND suffix_reuse_device_test)
+    endif()
     add_executable(suffix_reuse_resume_narrowing_test src/program/suffix_reuse_resume_narrowing_test.cpp)
     target_include_directories(suffix_reuse_resume_narrowing_test PRIVATE include)
     add_test(NAME suffix_reuse_resume_narrowing_test COMMAND suffix_reuse_resume_narrowing_test)
