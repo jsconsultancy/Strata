@@ -2945,7 +2945,7 @@ def ready_fetch(model: str, models_dir: Path) -> None:
             except OSError:
                 pass                                   # another drive: downloaded
         download(f"{hf_endpoint()}/{f[1]}/resolve/{f[2]}/{f[3]}", dst, f"{f[1].split('/')[-1]}: {f[3]}")
-        verify_sha256(dst, size, sha, SKIP_GGUF_SHA256)
+        verify_sha256(dst, size, sha, skip=SKIP_GGUF_SHA256)
 
 
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
@@ -7598,7 +7598,7 @@ def preview_family(a) -> int:
     for f in files:
         url = (fam["mmproj_hf"] if f.name == fam["mmproj"] else fam["hf"]) + f.name
         download(url, f, "vision encoder" if f.name == fam["mmproj"] else None)
-        verify_sha256(f, *fam["sha256"][f.name], SKIP_GGUF_SHA256)
+        verify_sha256(f, *fam["sha256"][f.name], skip=SKIP_GGUF_SHA256)
     ok(f"{fam['title']} {model}: {folder}")
     say()
     say(f"{fam['title']} is downloaded, but this Strata version cannot run it yet (its engine path is in "
@@ -8713,7 +8713,7 @@ def main() -> int:
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
-            verify_sha256(mmproj, *fam["mmproj_sha256"], SKIP_GGUF_SHA256)
+            verify_sha256(mmproj, *fam["mmproj_sha256"], skip=SKIP_GGUF_SHA256)
         ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "

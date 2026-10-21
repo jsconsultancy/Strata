@@ -64,13 +64,13 @@ class Budget(unittest.TestCase):
         self.assertEqual(setup.resident_budget_gib(M, 63.7, 1.7), 38)  # a KV cache streamed to RAM comes out of it
 
 
-def quiet(fn, *args):
+def quiet(fn, *args, **kwargs):
     """-> (exit code or None, printed text)."""
     out = io.StringIO()
     code = None
     with contextlib.redirect_stdout(out):
         try:
-            code = fn(*args)
+            code = fn(*args, **kwargs)
         except SystemExit as e:
             code = e.code
     return code, out.getvalue()
@@ -118,7 +118,7 @@ class Sha256(unittest.TestCase):
     def test_skip_takes_another_build_as_it_is(self):
         """--skip-gguf-sha256: another build of the model (Huihui's abliterated shard) matches neither the pinned size
         nor the pinned hash, and is kept rather than deleted."""
-        code, out = quiet(setup.verify_sha256, self.f, 6001, "0" * 64, True)
+        code, out = quiet(setup.verify_sha256, self.f, 6001, "0" * 64, skip=True)
         self.assertIsNone(code, out)
         self.assertIn("--skip-gguf-sha256", out)
         self.assertIn("6,000 bytes on disk", out)
@@ -127,12 +127,12 @@ class Sha256(unittest.TestCase):
 
     def test_skip_does_not_hash(self):
         with mock.patch("hashlib.sha256", side_effect=AssertionError("hashed")):
-            code, out = quiet(setup.verify_sha256, self.f, 6000, self.sha, True)
+            code, out = quiet(setup.verify_sha256, self.f, 6000, self.sha, skip=True)
         self.assertIsNone(code, out)
 
     def test_skip_still_trusts_a_mark_that_holds_the_pinned_hash(self):
         setup.mark(self.f, f"sha256 {self.sha}")
-        code, out = quiet(setup.verify_sha256, self.f, 6000, self.sha, True)
+        code, out = quiet(setup.verify_sha256, self.f, 6000, self.sha, skip=True)
         self.assertIsNone(code, out)
         self.assertNotIn("--skip-gguf-sha256", out)                 # already checked: nothing to say
 
