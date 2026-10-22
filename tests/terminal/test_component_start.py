@@ -241,6 +241,40 @@ class ComponentStart(unittest.TestCase):
         engine = next(row for row in report["components"] if row["name"] == "engine")
         self.assertEqual(engine["status"], "ok")
 
+    def test_a_stalled_host_start_falls_back_to_a_direct_engine_probe(self):
+        # the update gate on a box whose runtime-host layer stalls before the engine's READY line: the same
+        # engine and the same arguments must still be installable when they answer directly
+        from strata_control import updater
+        install_fake_engine(self.components)
+        stage = self.root / "stage"
+        stage.mkdir()
+        component = ec.resolve(self.components, full=True)
+        ctx = updater.Context(components=self.components, source="feed", trusted={}, hardware={},
+                              run_config=str(self.config))
+        stalled = {"ok": False, "state": "starting", "error": "startup_wait_expired", "exit_code": 8}
+        with mock.patch.object(runtime, "start", return_value=stalled):
+            result = updater.default_test_start(stage, component, ctx)
+        self.assertTrue(result.get("generation_ready"), result)
+        self.assertIn("direct", result["detail"])
+        mark = (self.root / "ran.txt").read_text(encoding="utf-8")
+        self.assertIn("--serve", mark)
+
+    def test_a_direct_probe_that_never_reads_ready_is_still_a_failure(self):
+        from strata_control import updater
+        install_fake_engine(self.components)
+        stage = self.root / "stage"
+        stage.mkdir()
+        component = ec.resolve(self.components, full=True)
+        ctx = updater.Context(components=self.components, source="feed", trusted={}, hardware={},
+                              run_config=str(self.config))
+        stalled = {"ok": False, "state": "starting", "error": "startup_wait_expired", "exit_code": 8}
+        with mock.patch.object(runtime, "start", return_value=stalled), \
+             mock.patch.object(updater, "_direct_engine_probe",
+                               return_value={"ok": False, "error": "no READY in 900 s"}):
+            with self.assertRaises(updater.TestStartFailed) as caught:
+                updater.default_test_start(stage, component, ctx)
+        self.assertIn("no READY", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

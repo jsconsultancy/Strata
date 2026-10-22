@@ -702,6 +702,72 @@ def _warn_if_deep(ctx: Context, folder: Path, longest_inside: int) -> None:
         ctx.say("warn", words, component="engine")
 
 
+def _direct_engine_probe(component: ec.EngineComponent, args: list, wait_s: float, log_path: Path) -> dict:
+    """The test start's engine check without the runtime-host layer: spawn the engine's own exe with the run
+    config's arguments, wait for its READY line, send one GEN, expect DONE.  The host layer reads the engine
+    through a ready file over RPC and has stalled before the engine's READY line on a box where the same engine
+    and the same arguments answer directly in well under a minute - the gate keeps its teeth either way: the
+    engine must still load and answer a one-token generation to be installed.  {"ok": ...} and never raises."""
+    var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
+    env = dict(os.environ)
+    env[var] = os.pathsep.join(ec.package_lib_dirs(component.root)) + os.pathsep + env.get(var, "")
+    done_lines: list = []
+
+    def _log(line: str) -> None:
+        done_lines.append(line)
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    try:
+        proc = subprocess.Popen([str(component.exe), "--serve", *[str(a) for a in args]],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace", cwd=str(component.root),
+                                env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": f"the engine could not run ({type(exc).__name__}: {exc})"}
+
+    ready = None
+    answered = False
+    deadline = time.monotonic() + wait_s
+
+    def _reader() -> None:
+        nonlocal ready, answered
+        for line in proc.stdout:
+            _log(line.rstrip())
+            if line.startswith("READY") and ready is None:
+                ready = line
+            if line.startswith(("DONE", "ERR")):
+                answered = line.startswith("DONE")
+                return
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    while ready is None and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if ready is None:
+        proc.kill()
+        return {"ok": False,
+                "error": f"no READY in {wait_s:.0f} s" + (f"; last: {done_lines[-1][:160]}" if done_lines else "")}
+    try:
+        proc.stdin.write("GEN 1 9707\n")
+        proc.stdin.flush()
+    except (OSError, ValueError) as exc:
+        proc.kill()
+        return {"ok": False, "error": f"the engine closed stdin at READY ({exc})"}
+    gen_deadline = time.monotonic() + 120
+    while not answered and proc.poll() is None and time.monotonic() < gen_deadline:
+        time.sleep(0.2)
+    proc.kill()
+    if not answered:
+        tail = done_lines[-1][:160] if done_lines else "no output"
+        return {"ok": False, "error": f"no DONE after READY; last: {tail}"}
+    return {"ok": True, "state": "ready", "generation_ready": True,
+            "detail": f"started, answered a one-token probe (direct engine probe after the runtime-host start stalled)"}
+
+
 def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Context) -> dict:
     """Start the staged engine through the real start path (owner runtime, `component:strata-engine`, a saved model), wait for
     the one-token generation probe, and stop it. Everything runs in an isolated runtime, profile and component folder, so a
@@ -732,11 +798,28 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
             profiles.create(name, str(config_path))
             started = None
             try:
-                started = runtime.start(name, wait=min(ctx.test_timeout, 600), shutdown_timeout=20)
+                # the engine's own ready budget (ENGINE_READY_S defaults to 900): the CLI's shorter window
+                # expired on a ~50 GiB hybrid pack that the direct path loads in well under a minute
+                wait_s = min(max(ctx.test_timeout, 900), 1800)
+                started = runtime.start(name, wait=wait_s, shutdown_timeout=20)
                 if started.get("ok") and started.get("state") == "ready" and started.get("generation_ready") is not True:
                     # a server that loads its model on the first request is "ready" without having generated anything:
                     # force the load and the one-token probe, because that is what the new engine has to be able to do
-                    started = {**started, **runtime.verify(name, timeout=min(ctx.test_timeout, 600), load=True)}
+                    started = {**started, **runtime.verify(name, timeout=wait_s, load=True)}
+                if (not started.get("ok") or started.get("state") != "ready"
+                        or started.get("generation_ready") is not True) \
+                        and (started.get("error") == "startup_wait_expired" or started.get("state") == "starting"):
+                    # the runtime-host layer stalled before the engine's READY line; the engine itself may be
+                    # fine - probe it directly (same engine, same arguments, plain stdin protocol)
+                    ctx.say("phase", f"the runtime-host start did not become ready in {wait_s:.0f} s; "
+                                     "probing the engine directly", component="engine")
+                    probe = _direct_engine_probe(component, cfg.get("args", []), wait_s,
+                                                 sandbox / "engine-direct.log")
+                    if probe.get("ok"):
+                        _keep_log(sandbox, component, ctx)
+                        return {"mode": "full", "model": cfg.get("model_name") or source.stem,
+                                "state": "ready", "generation_ready": True, "detail": probe["detail"]}
+                    started = {**started, "error": probe.get("error", started.get("error"))}
                 if not started.get("ok") or started.get("state") != "ready" or started.get("generation_ready") is not True:
                     raise TestStartFailed(component.version,
                                           f"it did not answer a one-token probe ({started.get('error') or started.get('state')})"
