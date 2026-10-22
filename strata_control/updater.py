@@ -761,6 +761,13 @@ def _direct_engine_probe(component: ec.EngineComponent, args: list, wait_s: floa
     while not answered and proc.poll() is None and time.monotonic() < gen_deadline:
         time.sleep(0.2)
     proc.kill()
+    try:
+        # kill() is async on Windows: the engine's exe and DLLs keep the staged component locked
+        # (WinError 32) until the process is really gone, and the install moves that directory next
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(2)
     if not answered:
         tail = done_lines[-1][:160] if done_lines else "no output"
         return {"ok": False, "error": f"no DONE after READY; last: {tail}"}
@@ -798,14 +805,23 @@ def default_test_start(stage_root: Path, component: ec.EngineComponent, ctx: Con
             profiles.create(name, str(config_path))
             started = None
             try:
-                # the engine's own ready budget (ENGINE_READY_S defaults to 900): the CLI's shorter window
-                # expired on a ~50 GiB hybrid pack that the direct path loads in well under a minute
-                wait_s = min(max(ctx.test_timeout, 900), 1800)
-                started = runtime.start(name, wait=wait_s, shutdown_timeout=20)
+                # runtime.start caps its own wait at 600; the direct fallback probe carries the engine's
+                # ready budget instead (900 s, ENGINE_READY_S's default), where a ~50 GiB hybrid pack needs it
+                started = runtime.start(name, wait=min(ctx.test_timeout, 600), shutdown_timeout=20)
                 if started.get("ok") and started.get("state") == "ready" and started.get("generation_ready") is not True:
                     # a server that loads its model on the first request is "ready" without having generated anything:
                     # force the load and the one-token probe, because that is what the new engine has to be able to do
-                    started = {**started, **runtime.verify(name, timeout=wait_s, load=True)}
+                    started = {**started, **runtime.verify(name, timeout=min(ctx.test_timeout, 600), load=True)}
+                if (not started.get("ok") or started.get("state") != "ready"
+                        or started.get("generation_ready") is not True) \
+                        and (started.get("error") == "startup_wait_expired" or started.get("state") == "starting"):
+                    # the runtime-host layer stalled before the engine's READY line; the engine itself may be
+                    # fine - probe it directly (same engine, same arguments, plain stdin protocol)
+                    wait_s = min(max(ctx.test_timeout, 900), 1800)
+                    ctx.say("phase", f"the runtime-host start did not become ready in {min(ctx.test_timeout, 600):.0f} s; "
+                                     f"probing the engine directly (up to {wait_s:.0f} s)", component="engine")
+                    probe = _direct_engine_probe(component, cfg.get("args", []), wait_s,
+                                                 sandbox / "engine-direct.log")
                 if (not started.get("ok") or started.get("state") != "ready"
                         or started.get("generation_ready") is not True) \
                         and (started.get("error") == "startup_wait_expired" or started.get("state") == "starting"):
