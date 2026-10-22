@@ -2865,17 +2865,23 @@ struct Engine {
         rows_mode = true;
         rows_G = T;
         rows_deferred = true;
-        run_graph_key(3000 + T, [&] {
+        // the MTP block's layer runs on the CPU pool whenever the experts do not all fit in VRAM (place_experts sets
+        // mtp_graph false for exactly that): a captured body never executes, so the hybrid half's event wait would
+        // spin inside the capture forever - the block's rows go eager then, as spec_step's drafts do
+        const bool mtp_rows_graph = use_graph && mtp_graph;
+        auto mtp_rows_body = [&] {
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
             k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);                 // [e | ...]
             k_rms_ld<<<T, kThreads, 0, st>>>(mtp_seed(), N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);   // [... | h]
             mm(m->eh_proj, mtp_cat, x, T);
             k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
-            layer(m->mtp, m->layers.size(), T, pmax, pos0_m, use_graph, false, m->mtp_shnorm, hmtp);
+            layer(m->mtp, m->layers.size(), T, pmax, pos0_m, mtp_rows_graph, false, m->mtp_shnorm, hmtp);
             mm(m->head, hmtp, logits_mr, T);
             k_argmax<<<dim3(kArgBlocks, T), kThreads, 0, st>>>(logits_mr, (int) g.n_vocab, pick_mr, amv, ami, false);
             k_argmax<<<dim3(1, T), kThreads, 0, st>>>(logits_mr, kArgBlocks, pick_mr, amv, ami, true);
-        });
+        };
+        if (mtp_rows_graph) run_graph_key(3000 + T, mtp_rows_body);
+        else mtp_rows_body();
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick_mr, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
