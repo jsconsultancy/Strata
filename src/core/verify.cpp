@@ -3712,7 +3712,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
+    if (copy_used_) {                        // as the solo window (run): nothing to wait for when this
+        cudaStreamSynchronize(copy_);        // window queued no copy-stream work (fetch_dma did not run)
+        copy_used_ = false;
+    }
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
