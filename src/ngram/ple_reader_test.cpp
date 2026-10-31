@@ -420,9 +420,12 @@ int selftest(const std::string& dir, uint32_t rb) {
         check_rows(rd, rows, N, rb, "keep-alive, first ticket");
         const uint64_t reads0 = rd.snapshot().reads;
         const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const double t_n1 = now_us() / 1000.0;
         nap(300);
+        const double el1 = now_us() / 1000.0 - t_n1;   // a coarsened Windows timer makes Sleep(300) longer
         const uint64_t k1 = rd.snapshot().keepalive_reads;
-        CHECK(k1 >= 8 && k1 <= 20, "keep-alive: %llu reads in 300 ms at a 20 ms period", (unsigned long long) k1);
+        CHECK(k1 >= (uint64_t)(el1 / 60.0) && k1 <= el1 / 20.0 + 6,
+              "keep-alive: %llu reads in %.0f ms at a 20 ms period", (unsigned long long) k1, el1);
         CHECK(rd.snapshot().reads == reads0, "keep-alive reads were counted as row reads");
         nap(600);                                          // the 0.5 s window has passed
         const uint64_t k2 = rd.snapshot().keepalive_reads;
@@ -433,8 +436,10 @@ int selftest(const std::string& dir, uint32_t rb) {
         CHECK(k2 <= k1 + 20, "keep-alive: %llu reads by the end of a 0.5 s window", (unsigned long long) k2);
         check_rows(rd, rows, N, rb, "keep-alive, cached ticket");   // the row cache serves all 16: no row read
         CHECK(rd.snapshot().reads == reads0, "cached rows were read again");
+        const double t_n2 = now_us() / 1000.0;
         nap(200);
-        CHECK(rd.snapshot().keepalive_reads >= k3 + 5, "the keep-alive did not start again (%llu -> %llu)",
+        const double el2 = now_us() / 1000.0 - t_n2;
+        CHECK(rd.snapshot().keepalive_reads >= k3 + (uint64_t)(el2 / 60.0), "the keep-alive did not start again (%llu -> %llu)",
               (unsigned long long) k3, (unsigned long long) rd.snapshot().keepalive_reads);
         std::vector<uint32_t> more(2000);
         for (auto& r : more) r = rng() % N;
