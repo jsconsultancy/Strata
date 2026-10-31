@@ -1287,6 +1287,16 @@ from which source. The line is printed before the model is loaded, so its credit
 cache at that moment, not at the time of a park. Without a cgroup limit and without `--memory-limit-mib` the figure is
 plain `MemAvailable`, as before.
 
+When the arena does not fit in the RAM that is left, the engine does not start cold into a
+reclaim storm: it waits (up to 20 s, `STRATA_ARENA_RAM_WAIT_S`, `0` disables) for the memory the
+previous engine is still returning, then warns with what it needs and what it sees. The server
+side of the same problem (#4051): an engine left running by a lost server is ended before the
+next one starts, and the start now waits up to 120 s for it to give its memory back — tens of
+gigabytes released by a process under memory pressure are not returned in seconds, and a new
+engine loading beside an old one that still holds 50 GiB is what put a 60 GiB PC into permanent
+reclaim. A leftover that outlasts the wait is named in the log and the start proceeds; the
+engine's own wait then carries it.
+
 What it does not touch: the startup sizing of the expert arena, the file tier's resident budget, the Windows commit
 check and `STRATA_PIN_GUARD` (#1250: whether to page-lock the expert copy in steps follows `MemFree`, and each step
 is checked against the cgroup-aware `host_available_memory`) keep their own probes (`--resident-budget-gib`, #633,
