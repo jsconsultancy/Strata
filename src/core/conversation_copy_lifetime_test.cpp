@@ -79,22 +79,23 @@ using strata::core::conversation_detail::copy_nonblocking;
 
 int main() {
     using namespace fixture;
-    // Models one fresh async stage thread per chunk: retained streams used to
-    // increase by one each time, even after every worker had been joined.
+    // Models one fresh async stage thread per chunk (#3350): the first worker creates the card's stream, and every
+    // worker that ends hands its handle back to the process-wide pool for the next one to take - pooled, never
+    // destroyed, so the number of streams is the number of workers copying at once, not that of workers ever run.
     for (int i = 0; i < 32; ++i) {
         std::thread([] {
             check(copy_nonblocking(nullptr, nullptr, 0) == cudaSuccess, "first copy");
             check(copy_nonblocking(nullptr, nullptr, 0) == cudaSuccess, "reuse stream");
         }).join();
-        check(live.empty(), "exited worker retains a stream");
+        check(live.size() <= 1, "an exited worker hands its stream to the pool (nothing is destroyed, one lives)");
     }
-    check(created == 32 && destroyed == 32, "one stream per worker");
+    check(created == 1 && destroyed == 0, "32 sequential workers share one pooled stream");
     const int before = created;
     std::thread([] {
         for (int i = 0; i < 32; ++i)
             check(copy_nonblocking(nullptr, nullptr, 0) == cudaSuccess, "persistent worker copy");
     }).join();
-    check(created == before + 1 && live.empty(), "persistent worker reuses one stream");
+    check(created == before && live.size() == 1, "a new worker takes the pooled stream, not a new one");
 
     std::vector<std::thread> workers;
     for (int i = 0; i < 16; ++i) workers.emplace_back([] {
@@ -107,9 +108,28 @@ int main() {
         after_owner.expected = device;
     });
     for (auto& worker : workers) worker.join();
-    check(live.empty() && errors == 0, "multi-device cleanup and device restoration");
+    // every device used (0, 2, 3) ends with its stream(s) in the pool and nothing was destroyed; the exact number is
+    // bounded by the concurrency (16 workers at once), exactly as in the device-side streams test
+    int n0 = 0, n2 = 0, n3 = 0;
+    for (auto& kv : live) { if (kv.second == 0) ++n0; else if (kv.second == 2) ++n2; else ++n3; }
+    check(n0 >= 1 && n2 >= 1 && n3 >= 1 && (size_t)(n0 + n2 + n3) == live.size() && live.size() == (size_t)created &&
+              destroyed == 0 && errors == 0,
+          "multi-device pooling: every used device keeps its streams pooled, none destroyed, device restored");
 
-    std::thread([] {
+    // Pooling means a stream is only created when the pool is empty, so the creation-failure path is reached by
+    // draining device 0's pool first: these workers take the pooled streams and stay alive while the failure paths
+    // are exercised, then hand them back.
+    std::atomic<int> drained{0};
+    std::atomic<bool> release{false};
+    std::vector<std::thread> drain;
+    for (int i = 0; i < 64; ++i)
+        drain.emplace_back([&] {
+            (void) copy_nonblocking(nullptr, nullptr, 0);
+            ++drained;
+            while (!release.load()) std::this_thread::yield();   // stay alive: leaving here would pool the stream back
+        });
+    std::thread([&] {
+        while (drained.load() < 64) std::this_thread::yield();   // the pool of device 0 is empty now
         fail_get = true;
         check(copy_nonblocking(nullptr, nullptr, 0) == failure, "device query failure");
         fail_get = false;
@@ -122,7 +142,9 @@ int main() {
         fail_sync = true;
         check(copy_nonblocking(nullptr, nullptr, 0) == failure, "sync failure");
         fail_sync = false;
+        release = true;
     }).join();
-    check(live.empty() && created == destroyed && errors == 0, "error paths release owned streams");
-    std::puts("PASS: worker exit, stream reuse, concurrent devices, failure cleanup");
+    for (auto& t : drain) t.join();
+    check(live.size() == created && destroyed == 0 && errors == 0, "the pool keeps what it made; failure paths add no live handle");
+    std::puts("PASS: worker exit, pool reuse, concurrent devices, failure cleanup");
 }
