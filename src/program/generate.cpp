@@ -28,6 +28,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/ple_residency.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -4092,6 +4093,50 @@ int main(int argc, char** argv) {
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // Upstream 3b34b6c7 + 472de9cd: keep the table resident in RAM when the PC can afford it.  The rows of a
+        // prompt token are random ~90 B reads in a multi-GiB table, so even a cached direct read pays ~100 us a token.
+        // Measured upstream (R9700, IQ3_S, 8K prompt): PLE block 845 ms direct / 451 ms mmap / 132 ms resident,
+        // prompt 2125 / 2368 / 2611 tok/s, identical answer md5.  The RAM cost is the table itself; admission needs
+        // table + the expert arena the engine will still fill + 8 GiB of headroom, measured before either is
+        // allocated (a locked table otherwise starved the arena's lockable memory: ERROR_WORKING_SET_QUOTA 1453 on a
+        // 64 GB Windows PC).  An explicit --ple-io always wins; STRATA_PLE_AUTO_RAM=0 turns the policy off.
+        if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
+            const strata::kernels::PleIoOptions direct_pio = pio;
+            const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
+            const bool allowed = auto_ram == nullptr || std::atoi(auto_ram) != 0;
+            const uint64_t need = ple_table.table_bytes();
+            const auto available = strata::core::available_host_bytes();
+            uint64_t experts_ram = 0;   // every routed expert's blob: the arena the engine copies into RAM at start
+            {
+                const auto& elay = strata::kernels::cpu::expert_layout();
+                for (int64_t l = 0; l < elay.n_layers; ++l)
+                    experts_ram += elay.blob_bytes(l) * (uint64_t) elay.n_expert;
+            }
+            if (allowed && need > 0 && strata::core::ple_resident_admit(available, need, experts_ram, 8ull << 30)) {
+                ple_table.close();
+                pio.mode = strata::kernels::PleIo::Mmap;
+                pio.lock = true;
+                pio.keepalive_ms = 0;
+                std::string ram_err;
+                if (ple_table.open(o.ple_gguf, ram_err, pio)) {
+                    std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is "
+                                         "%.1f GiB, the expert arena still to fill %.1f GiB and %.1f GiB of RAM is "
+                                         "available; STRATA_PLE_AUTO_RAM=0 keeps the direct reads, --ple-io direct "
+                                         "forces them)\n",
+                                 (double) need / (1ull << 30), (double) experts_ram / (1ull << 30),
+                                 available ? (double) *available / (1ull << 30) : 0.0);
+                } else {
+                    // Back to what was asked for; a table that cannot be mapped must not stop the engine.
+                    std::fprintf(stderr, "strata generate: resident PLE table failed (%s); keeping direct reads\n",
+                                 ram_err.c_str());
+                    pio = direct_pio;
+                    if (!ple_table.open(o.ple_gguf, err, pio)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+            }
         }
         // Recommend, never force: when the default direct reads measure slow, switch to the mapped reads (40-100x
         // faster on the reporters' drives); an explicit --ple-io direct is kept and only warned about.
