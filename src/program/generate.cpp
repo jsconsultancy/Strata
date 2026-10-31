@@ -11214,7 +11214,11 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       // SAVE SLOT / RESTORE SLOT are supported: slot sessions exist on one device
+                                       " session_slots=" + std::to_string(
+                                           (stages.empty() && !multi_gpu && o.peer_device < 1 && o.prompt_cache > 0 &&
+                                            !bslot_ss.empty()) ? 1 : 0)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -12157,7 +12161,10 @@ int main(int argc, char** argv) {
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
-            // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
+            // UTF-8), and with --batch the slot forms SAVE SLOT <n> <path> | RESTORE SLOT <n> <path>: the
+            // conversation an idle batch slot holds, to and from the same file format (the main session is not a
+            // conversation cache there, so the plain forms are refused in batch mode and the SLOT forms outside it).
+            // The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
             // or failure that leaves the engine in step (the live session as it was, unless published=1 says the new
             // file already replaced the old one); FATAL <reason> (and the engine exits) for a restore transfer that
@@ -12168,7 +12175,20 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                std::string path = line.substr(save ? 5 : 8);
+                // the batch-slot form: `SAVE SLOT <n> <path>` / `RESTORE SLOT <n> <path>` - slot n's conversation.
+                // `slot` stays -1 for the plain main-session forms.
+                int slot = -1;
+                const bool slot_form = path.rfind("SLOT ", 0) == 0;
+                if (slot_form) {
+                    char* sp = nullptr;
+                    const long long n = std::strtoll(path.c_str() + 5, &sp, 10);
+                    if (sp != nullptr && sp > path.c_str() + 5 && *sp == ' ' && n >= 0 && n <= 4096) {
+                        slot = (int) n;
+                        path = std::string(sp + 1);
+                    }
+                }
+                const bool slot_mode = slot >= 0;
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -12197,14 +12217,35 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
-                if (path.empty()) { refuse("missing path"); continue; }
+                if (path.empty()) { refuse(slot_form ? "usage: SAVE SLOT <n> <path>" : "missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (slot_mode && o.batch <= 0) { refuse("the SLOT forms need --batch (parallel requests)"); continue; }
+                if (!slot_mode && o.batch > 0) {
+                    refuse("with --batch use SAVE SLOT <n> <path> / RESTORE SLOT <n> <path>: the main session is "
+                           "not a conversation cache there");
+                    continue;
+                }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                if (slot_mode && (slot >= (int) bs.size() || bslot_ss.empty() || bslot_ss[0].empty() ||
+                                  slot >= (int) bslot_ss[0].size() || (batch_mtp && slot >= (int) slot_mtp.size()))) {
+                    refuse("no such batch slot: slots are 0.." + std::to_string(std::max<int>(0, (int) bs.size() - 1)));
+                    continue;
+                }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                // what this save/restore reads and writes: the main session, or one idle batch slot (its stage-0
+                // session and, with --batch-mtp, its draft KV; without it the image carries no draft layer)
+                BSlot* const sb = slot_mode ? &bs[(size_t) slot] : nullptr;
+                strata::core::SessionState* const ssp = slot_mode ? bslot_ss[0][(size_t) slot].get() : &ss;
+                strata::core::QsaState* const draftp = slot_mode
+                    ? (batch_mtp && slot < (int) slot_mtp.size() ? &slot_mtp[(size_t) slot]->kv_state() : nullptr)
+                    : &mtp.kv_state();
+                if (slot_mode && sb->active) {
+                    refuse("the slot is decoding: it holds no idle conversation");
+                    continue;
                 }
                 strata::core::SessionFileIdentity id;
                 try {
@@ -12220,7 +12261,10 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    if (slot_mode) {
+                        if (sb->tainted) { refuse("the slot's state was dropped after non-finite logits (#879)"); continue; }
+                        if (!sb->cached || sb->ids.empty()) { refuse("the slot holds no complete conversation to save"); continue; }
+                    } else if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -12235,23 +12279,23 @@ int main(int argc, char** argv) {
                             strata::core::ConversationStateSizes z;
                             std::string why;
                             uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                            if (strata::core::conversation_session_sizes(g, *ssp, z, why)) {
+                                const uint64_t q = (uint64_t) std::max<int64_t>(ssp->qsa_alloc, 0);
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
                             sl.state_bytes = state;
-                            sl.tokens = live.size();
-                            sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.tokens = slot_mode ? sb->ids.size() : live.size();
+                            sl.images = slot_mode ? 0 : live_imgs.size();
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ssp->qsa_alloc, 0) + (draftp != nullptr ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
                             const auto freed = strata::core::session_save_reclaim(
-                                checks, conversations, sl, floor, strata::core::available_host_bytes);
+                                slot_mode ? sb->checks : checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
                                 // A removed tail must not mark a later checkpoint at this length as a tail.
-                                if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                if (!slot_mode && tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
                                         return int64_t(c.ids.size()) == tail_ckpt_len;
                                     })) tail_ckpt_len = -1;
                                 std::fprintf(stderr, "strata serve: save reclaimed %zu checkpoints, %zu parked, "
@@ -12271,17 +12315,22 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!strata::core::session_save_checkpoints(slot_mode ? sb->checks : checks, sl, admit,
+                                                                    disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        const std::vector<strata::core::ConversationImageKey> slot_no_imgs;
+                        const strata::core::ConversationView view{slot_mode ? sb->ids : live,
+                                                                  slot_mode ? slot_no_imgs : live_imgs,
+                                                                  disk_checks, slot_mode ? sb->cvec : cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, *ssp, g,
+                                                                         (const strata::core::QsaState*) draftp,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -12303,10 +12352,13 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
+                    const size_t tok_n = slot_mode ? sb->ids.size() : live.size();
+                    const std::string slot_tag = slot_mode ? " slot " + std::to_string(slot) : "";
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                                 "in %.1f ms (state %.1f ms)%s\n", tok_n, kept,
+                                 (slot_mode ? sb->checks.size() : checks.size()), bytes,
+                                 path.c_str(), ms(), capture_ms, slot_tag.c_str());
+                    std::printf("SAVED %zu %zu %.1f\n", tok_n, bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -12327,7 +12379,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, *ssp, g, mtp.kv_state(), (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -12344,7 +12396,8 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, *ssp, g,
+                                                                      (const strata::core::QsaState*) draftp, err)) {
                         refuse(err);
                         continue;
                     }
@@ -12353,11 +12406,12 @@ int main(int argc, char** argv) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
-                    conversations.take_reuse();   // retained K/V described the outgoing session
-                    live_ok = false;
+                    if (!slot_mode) conversations.take_reuse();   // retained K/V described the outgoing session
+                    if (!slot_mode) live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, *ssp, g,
+                                                                    (const strata::core::QsaState*) draftp, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -12368,23 +12422,41 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
-                    live = std::move(image.live.ids);
-                    live_imgs = std::move(image.live.imgs);
-                    checks = std::move(image.checkpoints);
-                    for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
-                    cvec_cached = image.cvec;
-                    live_ok = true;
-                    if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
-                        nan_flush = false;
-                        const size_t n_parked = conversations.clear();
-                        std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
-                                             "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
-                                     n_parked == 1 ? "" : "s");
+                    const size_t tok_n = (size_t) image.live.ids.size();
+                    if (slot_mode) {
+                        // the slot holds the restored conversation as a cache: the same fields a prompt read
+                        // leaves in an idle slot (see BYIELD), with the file's checkpoints
+                        const bool img = !image.live.imgs.empty();
+                        bs[(size_t) slot] = BSlot{};
+                        BSlot& sl = bs[(size_t) slot];
+                        sl.ids = std::move(image.live.ids);
+                        sl.checks = std::move(image.checkpoints);
+                        for (const ConvCheckpoint& c : sl.checks) check_clock = std::max(check_clock, c.used);
+                        sl.cvec = image.cvec;
+                        sl.img = img;
+                        sl.p = (int64_t) sl.ids.size();
+                        sl.cached = !sl.ids.empty() && !img && o.prompt_cache > 0;
+                    } else {
+                        live = std::move(image.live.ids);
+                        live_imgs = std::move(image.live.imgs);
+                        checks = std::move(image.checkpoints);
+                        for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                        cvec_cached = image.cvec;
+                        live_ok = true;
+                        if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
+                            nan_flush = false;
+                            const size_t n_parked = conversations.clear();
+                            std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
+                                                 "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
+                                         n_parked == 1 ? "" : "s");
+                        }
                     }
+                    const std::string slot_tag = slot_mode ? " slot " + std::to_string(slot) : "";
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
-                                 "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
-                                 ms(), read_ms);
-                    std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                                 "in %.1f ms (read+check %.1f ms)%s\n", tok_n,
+                                 (slot_mode ? bs[(size_t) slot].checks.size() : checks.size()), bytes, path.c_str(),
+                                 ms(), read_ms, slot_tag.c_str());
+                    std::printf("RESTORED %zu %zu %.1f\n", tok_n, bytes, ms());
                 }
                 std::fflush(stdout);
                 continue;

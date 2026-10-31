@@ -1327,9 +1327,10 @@ persisted across restarts; the session files below are.
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
-requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
-`"slot_save_path"` in the config); NAME must be a plain file name inside DIR. There is no erase action and the file
-format is Strata's own, not llama.cpp's:
+requests of llama-server's slot API, for its single slot 0 — and, with `parallel` (with an engine reporting
+`session_slots=1` in its INFO line), for every batch slot `0..parallel-1` — when started with `--slot-save-path DIR`
+(also `"slot_save_path"` in the config); NAME must be a plain file name inside DIR. There is no erase action and the
+file format is Strata's own, not llama.cpp's:
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
@@ -1371,7 +1372,10 @@ the session file format are unchanged. RESTORE is unchanged.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
-everywhere. Errors: `501` without `--slot-save-path` or with parallel requests; `400` for a slot other than 0, an unknown action, a refused
+everywhere. Errors: `501` without `--slot-save-path`, and with parallel requests on an engine that does not report
+`session_slots=1` in INFO (with parallel requests the slots are `0..parallel-1`, and the save/restore serializes
+with admissions on the engine's control lines, so it cannot interleave with a request being admitted; `503` when
+the named slot is busy); `400` for a slot other than 0 (solo) or outside the batch slots, an unknown action, a refused
 file name, or a file the engine refuses as invalid (not a session file, corrupt, another model or configuration, over
 this session's limits; the session is as it was); `404` for a restore of a missing file; `503` while the model is not
 loaded, when the RAM to read the file is not there or an allocation failed; `507` when the disk has no room (the
@@ -1384,7 +1388,13 @@ failed after its new file had replaced the old one says so with `error.published
 continue the restored conversation reuses the restored state or its checkpoint; a short tail may be read again (35
 tokens in the measurement below). Only the deepest checkpoint is saved, so an edit further back reads more again.
 Clients still send their messages (and images): the file holds engine state and token/image identity, not a chat
-export. Underneath, `strata --serve` takes `SAVE <path>` and `RESTORE <path>` on stdin between requests and answers
+export. Underneath, `strata --serve` takes `SAVE <path>` and `RESTORE <path>` on stdin between requests — with
+`--batch`, the slot forms `SAVE SLOT <n> <path>` / `RESTORE SLOT <n> <path>`: the conversation idle batch slot n
+holds (its checkpoints, its slot sessions' K/V, and the slot drafter's K/V with `--batch-mtp`; without it the file
+carries no draft layer). The slot must be idle; a SAVE slot must hold a complete cached conversation (not a
+#879-tainted one; picture conversations are never slot-cached). The plain forms are refused in batch mode and the
+SLOT forms outside it; a restore leaves the slot cached with the file's conversation, ready for a request that
+continues it, and the answers are the same. It answers
 `SAVED <tokens> <bytes> <ms>`, `RESTORED <tokens> <bytes> <ms>`, `SERR <kind> <published 0|1> <reason>` (failed,
 the engine and the session as they were) or `FATAL <reason>` (then exits). On the way, `SESSION <done> <total>` follows
 every block of the file that moved (at most 16 MiB, the last partial block and a small file included), and

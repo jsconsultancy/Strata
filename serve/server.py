@@ -2385,8 +2385,11 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
-        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+    def session_file(self, action: str, path: str, slot: int | None = None) -> dict:
+        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO;
+        with `slot`, the batch-slot forms `SAVE SLOT <n> <path>` / `RESTORE SLOT <n> <path>` - the conversation
+        that idle batch slot n holds; the caller holds the control lines `ctl` instead, and the engine refuses a
+        slot that is decoding).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
@@ -2399,8 +2402,11 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        if slot is not None and (isinstance(slot, bool) or not isinstance(slot, int) or slot < 0):
+            raise ValueError("invalid session command")
+        verb = "SAVE" if action == "save" else "RESTORE"
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{verb}{'' if slot is None else f' SLOT {slot}'} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -3941,18 +3947,31 @@ class Service:
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
-        to or from a file in slot_save_path.  -> (HTTP status, body)."""
+        to or from a file in slot_save_path.  With parallel requests the id is one of the engine's batch slots:
+        the conversation that idle slot holds, saved and restored with the engine's SAVE SLOT / RESTORE SLOT
+        forms, issued on the engine's control lines so they cannot interleave with an admission (#465).
+        -> (HTTP status, body)."""
         def error(code, message):
             return code, {"error": {"code": code, "message": message,
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
-        if getattr(self.engine, "batch", 0):
-            # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
-            # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
-            return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
-        if slot != "0":
-            return error(400, "this server has one slot: 0")
+        batch = int(getattr(self.engine, "batch", 0) or 0)
+        if batch:
+            if not (self.engine.info or {}).get("session_slots"):
+                # #465: parallel requests share the engine's control lines; only an engine that advertises the
+                # SAVE SLOT / RESTORE SLOT forms takes a session file between admissions
+                return error(501, "slot save/restore with parallel requests needs an engine that reports "
+                                  "session_slots=1 (restart the engine, or run without \"parallel\")")
+            if not (slot.isdigit() and int(slot) < batch):
+                return error(400, f"this server has slots 0..{batch - 1}")
+            slot_n = int(slot)
+            if self.engine.slot_busy[slot_n]:
+                return error(503, f"slot {slot_n} is decoding: save or restore it when its request has ended")
+        else:
+            if slot != "0":
+                return error(400, "this server has one slot: 0")
+            slot_n = None
         if action not in ("save", "restore"):
             return error(400, "action must be save or restore")
         why = slot_filename_problem(filename)
@@ -3969,22 +3988,23 @@ class Service:
             self.status["queued"] += 1
         waiting = True
         try:
-            with self.fifo:
+            with (self.fifo if slot_n is None else self.engine.ctl):   # solo: the FIFO; batch: the control lines
                 with self.status_lock:
                     self.status["queued"] -= 1
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
-                with self.status_lock:
-                    self.status.update(busy=True, phase="saving the session" if action == "save"
-                                       else "restoring a session", started=time.time(), first_token=None,
-                                       prompt_tokens=None, generated=None, max_tokens=None)
+                if slot_n is None:
+                    with self.status_lock:
+                        self.status.update(busy=True, phase="saving the session" if action == "save"
+                                           else "restoring a session", started=time.time(), first_token=None,
+                                           prompt_tokens=None, generated=None, max_tokens=None)
                 try:
-                    if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
+                    if action == 'save' and slot_n is None and getattr(self.engine, 'session_save_reclaim', False):
                         from serve.session_save_retry import session_file
                         r = session_file(self, action, path, SessionRefused)
                     else:
-                        r = self.engine.session_file(action, path)
+                        r = self.engine.session_file(action, path, slot_n)
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -3994,17 +4014,18 @@ class Service:
                 except ValueError as e:                     # the request itself (an invalid command)
                     return error(400, str(e))
                 finally:
-                    with self.status_lock:
-                        self.status["busy"] = False
+                    if slot_n is None:
+                        with self.status_lock:
+                            self.status["busy"] = False
                     self.last_request_at = time.time()
         finally:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
         if action == "save":
-            return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
+            return 200, {"id_slot": slot, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
-        return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
+        return 200, {"id_slot": slot, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
