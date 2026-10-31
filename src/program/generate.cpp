@@ -139,6 +139,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2994,6 +2995,18 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
+    if (o.serve) {
+        // Ctrl+C / Ctrl+Break reach a console's every process, the engine too.  The server stops on them and ends
+        // the engine with QUIT - which first parks the conversation it holds (and a session save is in flight
+        // nowhere: it runs between requests).  Ending on the event itself loses all of that, so the engine ignores
+        // the C runtime's SIGINT/SIGBREAK (SIGTERM on POSIX), as Maya does for the same reason (#576).
+        std::signal(SIGINT, SIG_IGN);
+#ifndef _WIN32
+        std::signal(SIGTERM, SIG_IGN);
+#else
+        std::signal(SIGBREAK, SIG_IGN);
+#endif
+    }
     // STRATA_PRIMARY_DEVICE: which VISIBLE device the engine's own session runs on.  The Windows HIP runtime
     // enumerates the cards in a fixed order no HIP_VISIBLE_DEVICES list can change (it only filters), so with a
     // slower card first a run could only put the model on it (RX 6600 before RX 6800).  0 (unset) is upstream's
