@@ -54,21 +54,6 @@ inline constexpr int32_t kNotResident = -1;
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 
-/// STRATA_PROFILE_SEED=<top> (opt-in): the profile fill leaves the adaptive tier's usage counts at zero, so in its
-/// first rounds a resident expert the profile ranked hot but this text has not routed yet loses to any candidate
-/// routed twice (the tier's admission is `usage >= 2`, a swap needs `candidate >= victim + min_gain`).  Seed the
-/// counts of the experts the fill actually placed, graded by their profile rank (top at rank 0, a quarter of it at
-/// the last), so the profile's own experts get the first rounds to justify themselves - the seeded count decays
-/// with every round like a measured one.  Avalon's preloaded-LFU prior (its 9d51ead4/9f0d0379), in this engine's
-/// count units: one routing of one token adds 1.  `resident`: the cache's table (layer x expert, a slot or
-/// kNotResident).  Returns how many entries were seeded.  No-op when the profile or the usage vector is empty.
-int64_t seed_profile_usage(std::vector<float>& usage, int64_t n_layers, int64_t n_expert,
-                           const std::vector<std::pair<int32_t, int32_t>>& ranked,
-                           const std::vector<int32_t>& resident, float top);
-
-/// STRATA_PROFILE_SEED's value, read once: 0 (off) unless a number of routings in 0..64 was given.
-float profile_seed_top();
-
 /// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
 /// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
 /// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine

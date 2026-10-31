@@ -1032,9 +1032,6 @@ void usage() {
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
-                 "  (env) STRATA_PROFILE_SEED=N  the adaptive tier starts from the profile: every expert the\n"
-                 "                       profile fill placed begins at N routings (rank-graded down to N/4), so\n"
-                 "                       the first adaptation rounds keep what the profile ranked hot.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -10065,11 +10062,6 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        // STRATA_PROFILE_SEED (opt-in): the profile fill's own experts start with their rank as a prior count, so
-        // the first adaptation rounds do not evict what the profile ranked hot before this text has routed it
-        if (strata::core::profile_seed_top() > 0.0f)
-            strata::core::seed_profile_usage(drive.d.usage, g.n_layers, g.n_expert, profile, host_res,
-                                             strata::core::profile_seed_top());
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -16626,10 +16618,6 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        // STRATA_PROFILE_SEED (opt-in): the same prior at the serve path's per-request reset
-        if (strata::core::profile_seed_top() > 0.0f)
-            strata::core::seed_profile_usage(drive.d.usage, g.n_layers, g.n_expert, profile, host_res,
-                                             strata::core::profile_seed_top());
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends

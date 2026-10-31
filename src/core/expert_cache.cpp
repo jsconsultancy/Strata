@@ -140,59 +140,6 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     return true;
 }
 
-// STRATA_PROFILE_SEED: see the declaration in expert_cache.hpp.  The seed is the count a profile-ranked expert is
-// given when the fill placed it, graded by rank: `top` at rank 0 down to top/4 at the last ranked pair, so the
-// profile's own order survives at least the first adaptation rounds (the tier's decay, 0.7 a round, is applied to
-// the seed like to a measured count).  Only experts the cache HOLDS are seeded: a non-resident pair is a
-// candidate by placement, not a victim, and needs no prior.
-float profile_seed_top() {
-    static const float v = [] {
-        const char* e = std::getenv("STRATA_PROFILE_SEED");
-        if (e == nullptr || e[0] == '\0') return 0.0f;
-        char* end = nullptr;
-        const double d = std::strtod(e, &end);
-        if (end == e || *end != '\0' || !(d > 0.0) || d > 64.0) {
-            std::fprintf(stderr, "strata: STRATA_PROFILE_SEED=%s is not a number of routings in 0..64: ignored\n", e);
-            return 0.0f;
-        }
-        return (float) d;
-    }();
-    return v;
-}
-
-int64_t seed_profile_usage(std::vector<float>& usage, int64_t n_layers, int64_t n_expert,
-                           const std::vector<std::pair<int32_t, int32_t>>& ranked,
-                           const std::vector<int32_t>& resident, float top) {
-    if (top <= 0.0f || ranked.empty() || n_layers <= 0 || n_expert <= 0) return 0;
-    if (usage.size() < (size_t) (n_layers * n_expert)) return 0;
-    const size_t n = ranked.size();
-    int64_t seeded = 0;
-    float lo = top, hi = top;
-    for (size_t i = 0; i < n; ++i) {
-        const int32_t l = ranked[i].first, e = ranked[i].second;
-        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) continue;
-        const size_t at = (size_t) ((int64_t) l * n_expert + e);
-        if (!resident.empty() && (resident.size() <= at || resident[at] == kNotResident)) continue;
-        // 1 at rank 0, 0.25 at the last: a rank-graded prior, not a flat one (the tail of a profile is the part
-        // an adaptation round should replace first)
-        const float frac = n > 1 ? 1.0f - (float) i / (float) (n - 1) : 1.0f;
-        const float v = top * (0.25f + 0.75f * frac);
-        float& u = usage[at];
-        if (u < v) u = v;
-        lo = std::min(lo, v);
-        hi = std::max(hi, v);
-        ++seeded;
-    }
-    static bool said = false;
-    if (!said && seeded > 0) {
-        said = true;
-        std::fprintf(stderr, "strata: the adaptive tier starts from the profile: %lld resident experts seeded %.1f..%.1f "
-                             "routings by rank (STRATA_PROFILE_SEED=%.1f)\n",
-                     (long long) seeded, (double) lo, (double) hi, (double) top);
-    }
-    return seeded;
-}
-
 std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
                                                               const std::vector<uint8_t>& resident,
                                                               const std::vector<double>& heat,
