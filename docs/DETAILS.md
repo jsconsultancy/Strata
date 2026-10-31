@@ -1400,7 +1400,16 @@ the engine and the session as they were) or `FATAL <reason>` (then exits). On th
 every block of the file that moved (at most 16 MiB, the last partial block and a small file included), and
 `SWAIT <phase> <seconds>` comes before a step that blocks in one call (`fingerprint`, `capture`, `flush`, `publish`,
 `validate`, `transfer`): that step is allowed those seconds - 60 plus one per 4 MiB it concerns, at most 3600 - by the
-engine's watchdog and by the server, then it counts as stuck. The next line clears the allowance. The server checks
+engine's watchdog and by the server, then it counts as stuck. The next line clears the allowance. With `parallel` and
+`auto_sessions` (and a `session_slots=1` engine), the server does the same automatically for batch slots: a finished
+turn's slot conversation (at least `auto_sessions_min_tokens`) is saved to `DIR/auto-<key>.bin` by a background
+thread ~5 s after BDONE - the save takes the engine's control lines like an admission does, and is skipped when the
+slot has been re-admitted in the meantime (the live slot then beats the file) - and an incoming request whose
+conversation has a file, picked for a slot that holds no live copy of it, gets the file restored into that slot on
+its admission's control lines before its `BGEN`, so the engine continues from the saved state instead of re-reading
+the history. `manifest.json` (key -> tokens, bytes, saved time) tracks what is on disk; the same
+`auto_sessions_keep` / `auto_sessions_max_gb` pruning applies. A queued save is drained at a normal stop, best
+effort. The server checks
 every line: a malformed or unknown one, counts that are negative or go back, an allowance outside 1..3600 or a time
 that is not a finite number end the engine as out of step.
 

@@ -6,11 +6,13 @@ Mock engine: no GPU, no pack.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -88,8 +90,10 @@ class SlotEngine(StrataEngine):
         self.info = {"batch_slots": str(batch), "session_slots": "1"} if (batch and session_slots) else {}
         self.ctl = threading.Lock()
         self.slot_busy = [False] * max(batch, 1)
+        self.slot_held = [[] for _ in range(max(batch, 1))]
         self.slot_fail: dict[int, str] = {}
         self.fail = False
+        self.gen = 1
 
     def fresh(self):
         self.ended = False
@@ -115,7 +119,7 @@ class SlotSessions(unittest.TestCase):
     def test_batch_save_sends_the_slot_form_and_answers(self):
         code, body = self.act("1", "save")
         self.assertEqual(code, 200, body)
-        self.assertEqual(body["id_slot"], "1")
+        self.assertEqual(body["id_slot"], 1)
         self.assertEqual(body["n_saved"], 1000)
         self.assertEqual(self.engine.proc.sent, [f"SAVE SLOT 1 {self.dir.name}{os.sep}a.bin\n"])
         self.assertEqual(Path(self.dir.name, "a.bin").read_bytes(), b"x" * 1234)
@@ -169,7 +173,7 @@ class SlotSessions(unittest.TestCase):
         code, body = self.act("0", "save")
         self.assertEqual(code, 200, body)
         self.assertEqual(self.engine.proc.sent, [f"SAVE {self.dir.name}{os.sep}a.bin\n"])
-        self.assertEqual(body["id_slot"], "0")
+        self.assertEqual(body["id_slot"], 0)
         self.engine.fresh()
         code, body = self.svc.slot_action("1", "save", "b.bin")
         self.assertEqual(code, 400, body)
@@ -177,6 +181,86 @@ class SlotSessions(unittest.TestCase):
     def test_action_checked(self):
         code, body = self.act("0", "erase")
         self.assertEqual(code, 400, body)
+
+
+class ParallelAutoSessions(unittest.TestCase):
+    """The parallel auto-sessions flow: BDONE hook -> worker save (on ctl), admission hook -> restore,
+    manifest, and the inert paths (no capability, live prefix, no file)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.engine = SlotEngine()
+        self.svc = Service(self.engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.slot_save_path = self.dir.name
+        self.svc.auto_sessions = True
+        self.svc.auto_sessions_min_tokens = 4
+        self.svc.auto_par_save_min_s = 0.0
+        self.engine.fresh()
+
+    def file(self, key):
+        return Path(self.dir.name, f"auto-{key}.bin")
+
+    def test_finished_turn_is_saved_on_the_worker_with_the_slot_form(self):
+        self.svc.auto_tls.key = "conv1"
+        self.engine.slot_held[1] = [10, 11, 12, 13, 14]
+        self.svc._auto_par_note(1)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not self.file("conv1").exists():
+            time.sleep(0.05)
+        self.assertTrue(self.file("conv1").exists(), self.engine.proc.sent)
+        self.assertEqual(self.engine.proc.sent, [f"SAVE SLOT 1 {self.dir.name}{os.sep}auto-conv1.bin\n"])
+        self.assertEqual(self.svc.auto_par_manifest["conv1"]["tokens"], 1000)   # the engine's own saved count
+        with open(Path(self.dir.name, "manifest.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["conv1"]["tokens"], 1000)
+
+    def test_a_re_admitted_slot_is_not_saved(self):
+        self.svc.auto_tls.key = "conv2"
+        self.svc.auto_par_save_min_s = 0.3
+        self.engine.slot_held[2] = [20, 21, 22, 23, 24]
+        self.svc._auto_par_note(2)
+        self.engine.slot_busy[2] = True              # the next turn took the slot while the save waited
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self.file("conv2").exists())
+        self.assertEqual(self.engine.proc.sent, [])
+
+    def test_admission_restores_the_file_into_the_picked_slot(self):
+        self.svc.auto_tls.key = "conv3"
+        self.file("conv3").write_bytes(b"x" * 10)
+        self.engine.slot_held[0] = []
+        self.svc._auto_par_restore(0, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent, [f"RESTORE SLOT 0 {self.dir.name}{os.sep}auto-conv3.bin\n"])
+
+    def test_a_live_matching_prefix_beats_the_file(self):
+        self.svc.auto_tls.key = "conv4"
+        self.file("conv4").write_bytes(b"x" * 10)
+        self.engine.slot_held[1] = [1, 2]
+        self.svc._auto_par_restore(1, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent, [])
+
+    def test_no_file_no_command(self):
+        self.svc.auto_tls.key = "conv5"
+        self.engine.slot_held[1] = []
+        self.svc._auto_par_restore(1, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent, [])
+
+    def test_hooks_are_inert_without_the_capability(self):
+        self.engine.info = {"batch_slots": "3"}      # no session_slots
+        self.svc.auto_tls.key = "conv6"
+        self.engine.slot_held[1] = [1, 2, 3, 4, 5]
+        self.svc._auto_par_note(1)
+        self.svc._auto_par_restore(1, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent, [])
+        self.assertFalse(self.file("conv6").exists())
+
+    def test_hooks_are_inert_below_the_min_tokens(self):
+        self.svc.auto_tls.key = "conv7"
+        self.engine.slot_held[1] = [1, 2, 3]         # 3 < min_tokens 4
+        self.svc._auto_par_note(1)
+        time.sleep(0.3)
+        self.assertEqual(self.engine.proc.sent, [])
 
 
 if __name__ == "__main__":

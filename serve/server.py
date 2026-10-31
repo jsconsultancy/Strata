@@ -1942,6 +1942,9 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
+                    hook = getattr(self, "auto_restore_hook", None)   # parallel auto sessions: the saved conversation
+                    if hook is not None:                               # goes into the slot before its prompt reads
+                        hook(slot, prompt)
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
@@ -2053,6 +2056,9 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        hook = getattr(self, "auto_par_hook", None)   # parallel auto sessions: queue this turn's save
+                        if hook is not None:
+                            hook(slot)
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -3751,6 +3757,17 @@ class Service:
         self.auto_sessions_max_gb = 100.0             # their total bytes cap (0: no cap)
         self.auto_conv = None                         # the conversation the engine holds: {"key", "tokens"}
         self.auto_tls = threading.local()             # this request's conversation key (set by prepare)
+        # parallel (batch) auto sessions: the same idea on the engine's SAVE SLOT / RESTORE SLOT forms.  A finished
+        # request's slot conversation is saved on a background thread (it takes the control lines, so it never
+        # interleaves with an admission); an incoming request whose conversation has a file and whose picked slot
+        # holds no live copy of it is restored into that slot on the admission's control lines before its BGEN.
+        # Needs the engine's session_slots capability; every failure is logged and leaves the request alone.
+        self.auto_par_save_min_s = 5.0                # the finished turn settles before its slot is saved (s)
+        self._auto_par_q: queue.Queue = queue.Queue()
+        self._auto_par_worker = None
+        self.auto_par_manifest: dict[str, dict] = {}  # key -> {tokens, bytes, saved}: what is on disk
+        self.engine.auto_par_hook = self._auto_par_note          # the engine calls these at BDONE and at admission
+        self.engine.auto_restore_hook = self._auto_par_restore
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4022,10 +4039,11 @@ class Service:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
+        id_slot = int(slot) if slot.isdigit() else slot
         if action == "save":
-            return 200, {"id_slot": slot, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
+            return 200, {"id_slot": id_slot, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
-        return 200, {"id_slot": slot, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
+        return 200, {"id_slot": id_slot, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
@@ -5006,18 +5024,36 @@ class Service:
         start restores from.  Only when the service is idle - a running request's session is live, and saving it
         would capture a partial state - and best effort: a failure is logged and never blocks the stop."""
         cur = self.auto_conv
-        if not self.auto_sessions or cur is None or not self.slot_save_path:
+        if not self.auto_sessions or not self.slot_save_path:
             return
-        if not self.fifo.acquire(blocking=False):
-            print("[strata] auto sessions: a request is running, so the held conversation is not saved at "
-                  "shutdown", flush=True)
-            return
-        try:
-            self._auto_session_save(cur["key"])
-        except Exception as e:                        # never block the stop
-            print(f"[strata] auto sessions: cannot save the held conversation at shutdown: {e}", flush=True)
-        finally:
-            self.fifo.release()
+        if cur is not None:
+            if not self.fifo.acquire(blocking=False):
+                print("[strata] auto sessions: a request is running, so the held conversation is not saved at "
+                      "shutdown", flush=True)
+                return
+            try:
+                self._auto_session_save(cur["key"])
+            except Exception as e:                    # never block the stop
+                print(f"[strata] auto sessions: cannot save the held conversation at shutdown: {e}", flush=True)
+            finally:
+                self.fifo.release()
+        # parallel: drain the queued slot saves best effort (5 s of control lines each, stop on the first miss)
+        if self._auto_par_capable() and self._auto_par_worker is not None:
+            while True:
+                try:
+                    gen, slot, key, held = self._auto_par_q.get_nowait()
+                except queue.Empty:
+                    break
+                if not self.engine.ctl.acquire(timeout=5.0):
+                    break
+                try:
+                    if (self.engine.gen == gen and self.engine.alive()
+                            and not self.engine.slot_busy[slot] and self.engine.slot_held[slot] == held):
+                        self._auto_par_save_locked(slot, key)
+                except Exception as e:
+                    print(f"[strata] auto sessions (parallel): slot {slot} was not saved at shutdown: {e}",
+                          flush=True)
+                    break
 
     def _auto_session_prune(self):
         """Keep the newest auto_sessions_keep files and at most auto_sessions_max_gb of them (0: no such limit).
@@ -5050,6 +5086,88 @@ class Service:
                 break
         if removed:
             print(f"[strata] auto sessions: pruned {removed} file(s), {total / 1e9:.1f} GB kept", flush=True)
+
+    # ---- parallel auto sessions (batch slots): async save at BDONE, restore at admission ------------------
+
+    def _auto_par_capable(self) -> bool:
+        return (bool(self.auto_sessions and self.slot_save_path)
+                and int(getattr(self.engine, "batch", 0) or 0) > 0
+                and bool((getattr(self.engine, "info", None) or {}).get("session_slots")))
+
+    def _auto_par_note(self, slot):
+        """Engine hook at BDONE (the request's own thread: auto_tls is this request's key): its slot now holds a
+        finished turn; queue its save when it is worth a file.  The save itself runs on the worker."""
+        if not self._auto_par_capable():
+            return
+        key = getattr(self.auto_tls, "key", None)
+        if key is None:
+            return
+        held = self.engine.slot_held[slot]
+        if len(held) < int(self.auto_sessions_min_tokens):
+            return
+        self._auto_par_ensure_worker()
+        self._auto_par_q.put((self.engine.gen, slot, key, list(held)))
+
+    def _auto_par_ensure_worker(self):
+        if self._auto_par_worker is None:
+            self._auto_par_worker = threading.Thread(target=self._auto_par_worker_loop, daemon=True)
+            self._auto_par_worker.start()
+
+    def _auto_par_worker_loop(self):
+        # one save at a time; each takes the control lines like an admission does, after the turn has settled
+        # (a next turn arriving in the meantime reuses the live slot and this save is skipped)
+        while True:
+            gen, slot, key, held = self._auto_par_q.get()
+            time.sleep(max(0.0, float(self.auto_par_save_min_s)))
+            if not self.engine.ctl.acquire(timeout=30.0):
+                continue                                    # a long admission run: the next turn's save will cover
+            try:
+                if (self.engine.gen == gen and self.engine.alive() and not getattr(self.engine, "unloaded", False)
+                        and not self.engine.slot_busy[slot] and self.engine.slot_held[slot] == held):
+                    self._auto_par_save_locked(slot, key)
+            except EngineDied as e:                         # the engine is gone: the next request starts it
+                print(f"[strata] auto sessions (parallel): the save of slot {slot} ended the engine: {e}", flush=True)
+            except (SessionRefused, ValueError, EngineSilent) as e:
+                print(f"[strata] auto sessions (parallel): slot {slot} was not saved: {e}", flush=True)
+
+    def _auto_par_save_locked(self, slot, key):
+        path = os.path.join(self.slot_save_path, f"auto-{key}.bin")
+        r = self.engine.session_file("save", path, slot)
+        self._auto_par_manifest(key, int(r.get("tokens") or 0), int(r.get("bytes") or 0))
+        print(f"[strata] auto sessions (parallel): saved {r.get('tokens')} tokens "
+              f"({int(r.get('bytes') or 0) / 1e9:.2f} GB) of slot {slot} to auto-{key}.bin in "
+              f"{float(r.get('ms') or 0):.0f} ms", flush=True)
+        self._auto_session_prune()
+
+    def _auto_par_restore(self, slot, prompt):
+        """Engine hook at admission (the control lines are held here, the engine is between requests): when this
+        request's conversation has a file and the picked slot holds no live copy of it, load the file into the
+        slot so the engine continues from the saved state instead of re-reading the whole history."""
+        if not self._auto_par_capable():
+            return
+        key = getattr(self.auto_tls, "key", None)
+        if key is None:
+            return
+        path = os.path.join(self.slot_save_path, f"auto-{key}.bin")
+        if not os.path.isfile(path):
+            return
+        held = self.engine.slot_held[slot]
+        if held and len(prompt) >= len(held) and prompt[:len(held)] == held:
+            return                                          # the slot's live state is this conversation: keep it
+        r = self.engine.session_file("restore", path, slot)   # EngineDied propagates: the request path restarts
+        self.engine.slot_held[slot] = []
+        print(f"[strata] auto sessions (parallel): restored {r.get('tokens')} tokens from auto-{key}.bin into "
+              f"slot {slot} in {float(r.get('ms') or 0):.0f} ms", flush=True)
+
+    def _auto_par_manifest(self, key, tokens, bytes_):
+        self.auto_par_manifest[key] = {"tokens": tokens, "bytes": bytes_, "saved": round(time.time(), 3)}
+        try:
+            tmp = os.path.join(self.slot_save_path, "manifest.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.auto_par_manifest, f)
+            os.replace(tmp, os.path.join(self.slot_save_path, "manifest.json"))
+        except OSError:
+            pass                                            # informational: never fail the save over it
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
