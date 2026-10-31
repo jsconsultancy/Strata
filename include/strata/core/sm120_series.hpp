@@ -40,4 +40,9 @@ inline bool is_sm120(int major, int minor) { return cc_major_of(major) == 12 && 
 /// the default of a bitwise switch of the set: on for a 12.0 card unless STRATA_SM120_PERF=0
 inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) && sm120_series(); }
 
+/// STRATA_PROMPT_ATTN_IMMA (the prompt attention on int8 tensor cores, another summation order) when the user set nothing:
+/// ON for every CUDA card of compute capability 8.0 or newer (the int8 m16n8k32 MMA), not Turing / Volta / Pascal, not HIP.
+/// `cc` = 10 * major + minor as the engine resolves it.  Measured on sm_120 and sm_86: +1.1 .. +1.8% prompt, decode unchanged.
+inline bool prompt_attn_imma_default(bool hip, int cc) { return !hip && cc >= 80; }
+
 }  // namespace strata
