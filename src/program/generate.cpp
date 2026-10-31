@@ -12240,7 +12240,7 @@ int main(int argc, char** argv) {
                 // session and, with --batch-mtp, its draft KV; without it the image carries no draft layer)
                 BSlot* const sb = slot_mode ? &bs[(size_t) slot] : nullptr;
                 strata::core::SessionState* const ssp = slot_mode ? bslot_ss[0][(size_t) slot].get() : &ss;
-                strata::core::QsaState* const draftp = slot_mode
+                const strata::core::QsaState* const draftp = slot_mode
                     ? (batch_mtp && slot < (int) slot_mtp.size() ? &slot_mtp[(size_t) slot]->kv_state() : nullptr)
                     : &mtp.kv_state();
                 if (slot_mode && sb->active) {

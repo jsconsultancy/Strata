@@ -128,6 +128,10 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);
+// Disk save of a batch slot with no drafter of its own: `sources` holds the session's own QSA layers only.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session, const ModelGeometry& g,
+                                   const QsaState* draft, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
