@@ -1298,6 +1298,14 @@ struct LedgerTicketGuard {
     LedgerTicketGuard& operator=(const LedgerTicketGuard&) = delete;
 };
 
+// the host ledger's reclaimer for the expert cache: the resident RAM copy given back in one piece (the coarse
+// hammer — the complement arena is a single allocation).  Registered with the serving source once it is open;
+// a trim needs the same quiesce the park itself has (the loop thread, between windows), which is where the
+// ledger's admissions run.
+static uint64_t expert_complement_reclaim(void* ctx, uint64_t target) {
+    return static_cast<strata::core::FileExpertSource*>(ctx)->trim_resident(target);
+}
+
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
@@ -6016,6 +6024,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        strata::core::host_ledger_register("the expert cache's resident copy", &expert_complement_reclaim, &src);
         if (!pin_cand.empty()) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             uint64_t cand_b = 0, pin_b = 0;
@@ -9720,6 +9729,8 @@ int main(int argc, char** argv) {
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
                     ++evicted;
+                if (!admit() && strata::core::host_ledger_reclaim(additional) != 0)
+                    (void) admit();   // the ledger's reclaimers freed something (the expert cache's copy); one more look
                 if (!admit()) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),

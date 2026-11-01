@@ -1014,6 +1014,65 @@ void test_replace_resident(bool pin) {
     std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
 }
 
+// the host ledger's reclaimer: the resident copy given back in one piece, the refusals (a target that fits
+// beside it, a staged exchange), and the mapped files serving every expert after it
+void test_trim_resident(bool pin) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
+#else
+    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
+#endif
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t)BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*)truth[e].data(), (std::streamsize)bytes);
+        }
+        require((bool)out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    // experts 2 and 3 are in VRAM, the RAM budget holds 0 and 1, expert 4 stays on the file tier
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(1, err), err);
+    require(src.resident_bytes() == 2 * bytes, "fixture resident wrong");
+    // a room that fits beside the copy asks nothing of it
+    require(src.trim_resident(3 * bytes) == 0 && src.has_resident(0, 0), "a fitting target trimmed the copy");
+    // a staged exchange owns the copy's places until it commits
+    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(0), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+            "D2H eviction failed");
+    require(src.stage_exchange(0, 0, 2, 0), "stage rejected");
+    require(src.trim_resident(0) == 0 && src.has_resident(0, 0), "trimmed beside a staged exchange");
+    require(cache.fill_slot_blocking(0, truth[0].data(), err), err);
+    require(src.commit_exchanges() == 1, "commit count wrong");
+    // the trim: everything, in one piece
+    const uint64_t freed = src.trim_resident(0);
+    require(freed == 2 * bytes, "trim freed the wrong figure");
+    require(!src.complement_ready() && src.resident_bytes() == 0 && !src.has_resident(0, 0) && !src.has_resident(0, 1),
+            "residency wrong after the trim");
+    require(src.trim_resident(0) == 0, "a second trim found something to free");
+    // every expert reads from the mapped files now
+    std::vector<uint8_t> actual(bytes);
+    for (int e = 0; e < 5; ++e)
+        require(src.copy_blob(0, e, actual.data()) && actual == truth[(size_t)e], "the file tier changed after the trim");
+    if (pin) require(!src.pinned(0, 0) && !src.complement_pinned(), "a pin survived the trim");
+    std::cout << "trim_resident: pinned=" << pin << " exact_bytes=PASS\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1042,6 +1101,8 @@ int main(int argc, char** argv) {
             test_foresight_exchange(true);
             test_replace_resident(true);
             test_replace_resident(false);
+            test_trim_resident(true);
+            test_trim_resident(false);
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;

@@ -1651,6 +1651,42 @@ void FileExpertSource::close() {
     reads_ = 0;
 }
 
+// The host ledger's reclaimer (all-or-nothing: the arena is one allocation).  The guards mirror the exchange
+// machinery's own refusals ("exchange buffers are in use"): a staged or soft-committed exchange and an active
+// rotation all hold places in the copy, so those callers wait; the rest of the thread contract — the caller's
+// thread, between windows, nothing reading the RAM copy — is `replace_resident`'s, and the park admissions that
+// reach this through the ledger already run there.
+uint64_t FileExpertSource::trim_resident(uint64_t target) {
+    if (!complement_ready_ || complement_arena_ == nullptr) return 0;
+    if (complement_bytes_ <= target) return 0;   // the room asked for fits beside the copy
+    if (exchange_storage_.active() || !staged_.empty() || !soft_in_.empty()) return 0;
+    const uint64_t freed = complement_bytes_;
+    if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+    else {
+        if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+        if (complement_locked_ > 0)
+            strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+        std::free(complement_arena_);
+    }
+    complement_arena_ = nullptr;
+    complement_host_ = nullptr;
+    complement_device_ = nullptr;
+    complement_bytes_ = 0;
+    complement_offsets_.clear();
+    complement_pinned_ = false;
+    complement_partial_ = false;
+    complement_registered_ = false;
+    complement_pin_limit_ = 0;
+    complement_lock_off_ = 0;
+    complement_locked_ = 0;
+    complement_lent_slots_ = 0;
+    complement_ready_ = false;
+    std::fprintf(stderr, "strata: host ledger: the expert cache's resident copy (%.2f GiB) handed back; its experts "
+                         "read from the mapped files until the restart\n",
+                 (double) freed / 1073741824.0);
+    return freed;
+}
+
 
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);

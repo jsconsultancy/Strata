@@ -1480,9 +1480,13 @@ admission, the gfx12 16384-chunk ceiling, the prefill host plan — price themse
 commit verdict adds the open tickets to its planned figure, and the conversation cache is shed to
 min(configured, room − 2 GiB planned) at construction (0 disables parking) — the "frees cache slots" half of a
 low-commit start. When an admission comes up short the arbiter (`host_ledger_admit`) runs registered reclaimers
-(caches that give RAM back on demand) and credits the freed bytes at once (a fresh sample lags the kernel); a
-start under commit pressure — the measured 3.2 GiB free that dies at `cublasCreate` — is the acceptance, a
-deploy-window A/B. Off: no ids, an empty registry, and every site is byte-identical to before.
+(caches that give RAM back on demand) and credits the freed bytes at once (a fresh sample lags the kernel); the
+serving registry holds one reclaimer, the expert cache's resident copy — `FileExpertSource::trim_resident`, the
+compact complement given back in one piece (the arena is a single allocation, so the trim is all-or-nothing, and
+the experts read from the mapped files until a restart), refused beside a fitting target or a staged exchange,
+armed on the park admission after the parked-conversation evictions are spent (the same quiesce the park itself
+runs under); a start under commit pressure — the measured 3.2 GiB free that dies at `cublasCreate` — is the
+acceptance, a deploy-window A/B. Off: no ids, an empty registry, and every site is byte-identical to before.
 `host_ledger_test` runs both modes (the flag is read once, so on is its own `--on` process): the arithmetic,
 the ticket lifecycle, the registry order, the reclaim-then-credit recheck and the cache-shed rule.
 

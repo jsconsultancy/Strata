@@ -830,6 +830,13 @@ public:
     /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
     /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
     bool replace_resident(int64_t layer, int64_t in, int64_t out);
+    /// The host ledger's reclaimer: the compact copy given back in one piece.  The arena is one
+    /// allocation, so the trim is all-or-nothing: 0 when the copy is not ready, when it still fits
+    /// beside `target`, or when an exchange is staged/in flight.  Otherwise the arena goes back to
+    /// the kernel and the bytes are returned — the next read of a dropped expert comes from the
+    /// mapped file, and the copy is not rebuilt until a restart.  `replace_resident`'s thread
+    /// contract: the caller's thread, between windows, nothing reading the RAM copy.
+    uint64_t trim_resident(uint64_t target);
     int64_t ram_adapts() const { return ram_adapts_; }
     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread
     // (false: already queued, the queue is full, or no compact copy); `ram_install` - called by the decode thread at a window
