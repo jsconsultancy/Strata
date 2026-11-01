@@ -895,8 +895,28 @@ class OutputParser:
         # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
         # conversation's tools in the prompt only, and its calls come back as before.
         self.declared_only = declared_only
-        self._alias = {k.replace(".", "__", 1) for k in self.schemas if isinstance(k, str) and "." in k}
+        # #3796 reconciled spellings (the form our #3556 revert waited for): a declared tool is also read as
+        # namespace__member, namespace=member, namespace_member, the bare member when exactly one declared tool
+        # has it, and - the same class of difference - a name with every `__` collapsed to `_`
+        # (`mcp_playwright_browser_navigate` for `mcp__playwright__browser_navigate`, the way Qwen often
+        # flattens a name).  Only unambiguous aliases count, an exactly declared spelling always wins, and the
+        # call goes out under the DECLARED name; a reordered or renamed tool (`server1_label_values` for
+        # `label_values_mcp_server1`, `bash` for `shell`) is not guessed.
+        aliases = {}
+        for name in self.schemas:
+            if isinstance(name, str) and "." in name:
+                namespace, member = name.rsplit(".", 1)
+                for alias in (f"{namespace}__{member}", f"{namespace}={member}",
+                              f"{namespace}_{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
+        for name in self.schemas:
+            if isinstance(name, str) and "__" in name:
+                aliases.setdefault(name.replace("__", "_"), set()).add(name)
+        self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
+                        if len(names) == 1 and alias not in self.schemas}
+        self._alias = set(self.aliases)
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
+        self.unread_names: list[str] = []   # #3796: the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1117,6 +1137,7 @@ class OutputParser:
                 if b < 0:
                     return out
                 name = rest[a + 10:b]
+                name = self.aliases.get(name, name)   # #3796: tool_start names the declared tool
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
@@ -1236,8 +1257,10 @@ class OutputParser:
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
+                        name = self.aliases.get(name, name)   # #3796: an alias spelling is the declared tool
                         if name in self.schemas:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
+                            call.name = name
                     except ValueError:
                         pass
                     raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
@@ -1418,6 +1441,9 @@ class OutputParser:
                             self.buf = self.buf[j:]
                         return out
                     if gt >= 0 and (nl < 0 or gt < nl) and not self._callable(after[len(FUNC_START):gt].strip()):
+                        self.unread += 1             # #3796: counted like the drifted forms; logged and named by the server
+                        if len(self.unread_names) < 5:
+                            self.unread_names.append(after[len(FUNC_START):gt].strip()[:80])
                         out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                         self.buf = self.buf[i + len(CALL_START):]
                         continue
@@ -1515,9 +1541,11 @@ class OutputParser:
         """A whole call body in the template's form -> its tool_call event.  With recover, one that still does not
         parse is the text it is instead of an error that ends the request."""
         name = body.strip()[len(FUNC_START):].split(">", 1)[0].strip()
+        name = self.aliases.get(name, name)   # #3796: an alias spelling is the declared tool, named as declared
         bare, self.bare = self.bare, False
         try:
             call = parse_tool_call(body, self.schemas.get(name))
+            call.name = name
         except ValueError:
             if not self.recover:
                 raise

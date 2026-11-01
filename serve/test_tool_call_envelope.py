@@ -99,7 +99,8 @@ class OnlyDeclaredTools(unittest.TestCase):
 
     def test_the_responses_spelling_of_a_namespace_tool_counts(self):
         evs, p = run(body("<function=ns__web_search>", "q", "x"), 4, tools=TOOLS)
-        self.assertEqual(calls(evs), [("ns__web_search", {"q": "x"})])
+        # #3796 reconciled: the call goes out under the DECLARED name, not the spelling the model wrote
+        self.assertEqual(calls(evs), [("ns.web_search", {"q": "x"})])
 
     def test_no_tools_declared(self):
         raw = body("<function=search>", "q", "2+2")

@@ -1000,15 +1000,23 @@ print(r.choices[0].message.content)
   another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the
   text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule
   for Codex's compaction requests). A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>`
-  instead of `<function=NAME>`, is read as the call when NAME is a declared tool. A `<tool_call>` block that still
-  does not read as a call is counted in the server window.
-- **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
-  tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
+  instead of `<function=NAME>`, is read as the call when NAME is a declared tool. A declared name is also read in its
+  spelling variants - `namespace__member`, `namespace=member`, `namespace_member` and the bare member for a
+  `namespace.member` tool, and a name with every `__` collapsed to `_` (`mcp_playwright_browser_navigate` for
+  `mcp__playwright__browser_navigate`); only unambiguous spellings count, a tool declared under a spelling wins, the
+  call goes out under the declared name, and a reordered or renamed tool is not guessed (#3796). A `<tool_call>`
+  block that does not read as a call is counted (the window line says so, `/metrics/prometheus` as
+  `strata:tool_calls_unread_total`), and when it was a call for an undeclared name the reply also carries
+  `"strata_rejected_tool_calls": [{"name": ..., "reason": "undeclared"}]` - at the top level of a Chat Completions
+  reply, in its last streamed chunk, and in the `/v1/messages` message - so the agent turn ends with the names, not
+  with raw XML and silence. The text itself is untouched.
+- **Tool calls in other forms (on since 0.2.8).** `"tool_call_recovery": false` in `strata-<model>.json` turns off reading a call of a
+  tool the request declared when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
   (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
   without `<tool_call>` (outside code), or as a second call inside the same `<tool_call>` (without the switch the
   second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
   1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
-  92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
+  92.9% without.
 - **opencode's environment block in the user turn (opt-in).** opencode writes an `<env>` block (working directory,
   today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that
   are the same in every session. The prefix cache only reuses a prompt's start, so every new folder and every new day
