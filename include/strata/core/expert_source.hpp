@@ -861,6 +861,10 @@ public:
     /// the time spent reading the files, summed over threads.
     uint64_t file_blob_bytes() const { return file_blob_bytes_.load(std::memory_order_relaxed); }
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// The page reserve's refault signal: bytes of the Windows overlapped file reads that blocked
+    /// over the stall threshold (a completion that took 100 ms or more — the read the drive faults
+    /// on, not the drive streaming).  `take` clears it: the request path grows its price per segment.
+    uint64_t take_stall_bytes() { return stall_bytes_.exchange(0, std::memory_order_relaxed); }
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
@@ -1143,6 +1147,7 @@ private:
     std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
+    mutable std::atomic<uint64_t> stall_bytes_{0};    ///< page reserve: bytes of stalled (over-threshold) overlapped reads
     // ---- the Linux I/O path (set_io_prefetch)
     bool io_pf_ = false;
     bool io_fill_ = false;                            ///< experts.bin: the workers only fill the page cache (large preads), no staging, nothing waits

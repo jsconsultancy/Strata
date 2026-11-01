@@ -28,6 +28,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/host_reserve.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -9651,8 +9652,11 @@ int main(int argc, char** argv) {
                 std::optional<strata::core::HostMemoryReading> mem;
                 auto admit = [&] {
                     mem = strata::core::sample_host_memory();
+                    // the page reserve: a running prompt's priced file streaming is not up for grabs
                     return strata::core::conversation_memory_admit(
-                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
+                        strata::core::host_reserve_admission_available(
+                            mem ? std::optional<uint64_t>(mem->available) : std::nullopt),
+                        additional, floor);
                 };
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
@@ -9684,7 +9688,9 @@ int main(int argc, char** argv) {
                 }
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
-                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+                        strata::core::host_reserve_admission_available(
+                            mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt),
+                        0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
@@ -12415,7 +12421,8 @@ int main(int argc, char** argv) {
                         }
                         auto admit = [&](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                            const std::optional<uint64_t> avail = strata::core::host_reserve_admission_available(
+                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
@@ -12502,7 +12509,8 @@ int main(int argc, char** argv) {
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                            const std::optional<uint64_t> avail = strata::core::host_reserve_admission_available(
+                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
@@ -14969,6 +14977,26 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
+            // page reserve (STRATA_PAGE_RESERVE=1): the host bytes this read's file streaming is
+            // priced to need, held from every host RAM admission (park, save, restore) until this
+            // request's first decode token.  Priced from the observed streaming (an EMA seeded at
+            // 2 MiB/token — the prompt path's measured 24 GB over a fresh 17K-token prompt), capped
+            // at half of what is available now, so the price itself cannot starve an admission.
+            uint64_t page_ticket = 0, page_fbytes0 = 0;
+            constexpr uint64_t page_cap = 16ull << 30;
+            if (strata::core::page_reserve_env()) {
+                page_ticket = strata::core::host_reserve_open();
+                (void) src.take_stall_bytes();   // a previous request's stalls are not this read's
+                page_fbytes0 = src.file_read_bytes();
+                uint64_t price = strata::core::page_reserve_price(n - read_from);
+                const auto pm = strata::core::sample_host_memory();
+                const uint64_t cap = std::min(page_cap, pm ? pm->available / 2 : uint64_t(0));
+                if (price > cap) price = cap;
+                strata::core::host_reserve_add(page_ticket, price);
+                if (price > 0)
+                    std::fprintf(stderr, "strata serve: page reserve: %llu MiB held for this read (%lld tokens)\n",
+                                 (unsigned long long) (price >> 20), (long long) (n - read_from));
+            }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
@@ -15028,6 +15056,17 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata trace: the first window takes the last %lld prompt tokens\n",
                                      (long long) (n - merge_at));
                     std::fflush(stderr);
+                }
+                if (page_ticket != 0) {
+                    // refault growth: the segment that just read paid stalls (overlapped completions
+                    // blocking 100 ms+), so the price for the segments still ahead grows by them
+                    const uint64_t stalled = src.take_stall_bytes();
+                    if (stalled > 0) {
+                        const uint64_t added = strata::core::host_reserve_grow(page_ticket, stalled, page_cap);
+                        if (added > 0)
+                            std::fprintf(stderr, "strata serve: page reserve: grew by %llu MiB (a file read stalled)\n",
+                                         (unsigned long long) (added >> 20));
+                    }
                 }
                 if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
                     cancelled = true;
@@ -15130,6 +15169,8 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            strata::core::host_reserve_close(page_ticket);   // page reserve: the read streamed, decode starts
+            page_ticket = 0;
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
@@ -16321,6 +16362,8 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            if (strata::core::page_reserve_env() && !cancelled && yielded_at < 0)
+                strata::core::page_reserve_observe(src.file_read_bytes() - page_fbytes0, n - read_from);   // the next read's price
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

@@ -1451,6 +1451,22 @@ system prompt among them, the one its sibling conversations borrow. `Conversatio
 that case and the slot stays unparked (as in 0.2.6): parking it measured 323 ms → 4130 ms for the next
 overlapping request's 5 K-token prefix.
 
+**The page reserve** (`STRATA_PAGE_RESERVE=1`, opt-in, the Windows counterpart of the Linux reclaimable-file
+credit) makes the host-RAM admissions see the running prompt's streaming as already spent. The host figure on
+Windows is `min(ullAvailPhys, ullAvailPageFile)`, a sample that is not a reservation and carries no file-page
+credit (Linux credits the cgroup's clean `inactive_file`): a cold prompt streaming its experts through the host
+(a fresh 17K-token prompt reads 24 GB) is exactly the window where a park, a session save or a restore admitted
+on a fresh sample takes the room the read is crossing, and the read pays for it in refault stalls. At the
+request's read start the engine opens a ticket priced at (tokens to read) x (the observed file bytes per read
+token - an EMA seeded at 2 MiB/token from that 24 GB / 17K measurement); every host admission subtracts the sum
+of open tickets from the available figure; a segment whose overlapped file completions blocked 100 ms+ grows the
+ticket by the bytes of the stalled reads (for the segments still ahead); the first decode token closes it, and a
+read that ends without decoding (a BYIELD, a cancel) closes it at DONE. Tickets are per request, so a closing
+decode never drops another request's price; the price is capped at half the currently available RAM and 16 GiB.
+With the flag off no ticket opens, the counter stays 0, and every admission is byte-identical to before.
+`host_reserve_test` covers the tickets, the subtraction, the growth cap and the closes; the cold-cache 19K
+prompt A/B is the deploy-window gate.
+
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
 the draft layer's K/V. Format v1, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
 compile): a 64-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config

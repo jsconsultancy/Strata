@@ -2814,8 +2814,15 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     }
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
-    for (size_t q = 0; q < issued; ++q)
+    // The page reserve's refault signal: the batch is fully in flight before the first wait, so a
+    // completion that blocks for 100 ms or more (the beat cadence) is the drive faulting the read
+    // in, not streaming it — the bytes of those waits are counted for the request path to price with.
+    for (size_t q = 0; q < issued; ++q) {
+        const auto tq = std::chrono::steady_clock::now();
         if (!GetOverlappedResult(sc.req[q].h, &sc.ov[q], &got[q], TRUE)) ok = false;
+        const auto wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
+        if (wms >= 100.0) stall_bytes_.fetch_add(sc.req[q].size, std::memory_order_relaxed);
+    }
     if (!ok || issued < sc.req.size()) return false;
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
