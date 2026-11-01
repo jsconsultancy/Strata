@@ -934,12 +934,18 @@ def configure_slot_overlap_env(env: dict, cfg: dict) -> None:
     """PHASE 6.3: with parallel auto sessions (the config's "auto_sessions" and "parallel": N>=2), the engine
     restores a slot's conversation with each K/V layer going host -> device while the next one is read (its
     RESTORE SLOT path, STRATA_SESSION_OVERLAP=1; the engine reads the variable on every restore, and --batch-mtp
-    disables the overlap in the engine).  An engine that does not know the variable ignores it."""
+    disables the overlap in the engine).  The server also arms the prefetch form (STRATA_SESSION_PREFETCH=1): its
+    `RESTORE SLOT <n> <path> ASYNC` answers RSTART after the file's header and layer index and loads the K/V on
+    the engine's own thread, so the request's BGEN goes out at once and the admission waits at each layer.  An
+    engine that does not know a variable ignores it."""
     par = cfg.get("parallel")
     if cfg.get("auto_sessions") and isinstance(par, int) and not isinstance(par, bool) and par >= 2:
         env["STRATA_SESSION_OVERLAP"] = "1"
-    else:
-        env.pop("STRATA_SESSION_OVERLAP", None)
+        env["STRATA_SESSION_PREFETCH"] = "1"
+        return True
+    env.pop("STRATA_SESSION_OVERLAP", None)
+    env.pop("STRATA_SESSION_PREFETCH", None)
+    return False
 
 
 def tool_call_recovery_setting(cfg: dict) -> bool:
@@ -2425,12 +2431,15 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str, slot: int | None = None) -> dict:
+    def session_file(self, action: str, path: str, slot: int | None = None, *, async_restore: bool = False) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO;
         with `slot`, the batch-slot forms `SAVE SLOT <n> <path>` / `RESTORE SLOT <n> <path>` - the conversation
         that idle batch slot n holds; the caller holds the control lines `ctl` instead, and the engine refuses a
-        slot that is decoding).
-        -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
+        slot that is decoding).  `async_restore` sends the prefetch form `RESTORE SLOT <n> <path> ASYNC` (Phase
+        6.3): the engine answers RSTART <layers> <bytes> once the file's header and layer index are read and
+        loads the K/V layers on its own thread - no RESTORED line follows; the caller moves on (the request's
+        BGEN) and the engine's admission waits at each layer.
+        -> {"tokens", "bytes", "ms"}, or {"layers", "bytes"} for the prefetch form.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
         step: the engine is ended (EngineDied) and the next request starts it again.  EngineDied also when it ended
@@ -2445,14 +2454,17 @@ class StrataEngine:
         if slot is not None and (isinstance(slot, bool) or not isinstance(slot, int) or slot < 0):
             raise ValueError("invalid session command")
         verb = "SAVE" if action == "save" else "RESTORE"
+        if async_restore and (action != "restore" or slot is None):
+            raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{verb}{'' if slot is None else f' SLOT {slot}'} {path}\n")
+            self.proc.stdin.write(f"{verb}{'' if slot is None else f' SLOT {slot}'} {path}"
+                                  f"{' ASYNC' if async_restore else ''}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = ("RSTART" if async_restore else "SAVED" if action == "save" else "RESTORED")
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2516,6 +2528,14 @@ class StrataEngine:
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
             if head == want:
+                if async_restore:
+                    try:
+                        if len(f) != 3:
+                            raise ValueError
+                        layers, size = count(f[1]), count(f[2])
+                    except ValueError:
+                        raise out_of_step(line) from None
+                    return {"layers": layers, "bytes": size}
                 try:
                     if len(f) != 4:
                         raise ValueError
@@ -3800,6 +3820,7 @@ class Service:
         self._auto_par_q: queue.Queue = queue.Queue()
         self._auto_par_worker = None
         self.auto_par_manifest: dict[str, dict] = {}  # key -> {tokens, bytes, saved}: what is on disk
+        self.slot_prefetch = False                    # Phase 6.3: the engine was started with STRATA_SESSION_PREFETCH=1
         self.engine.auto_par_hook = self._auto_par_note          # the engine calls these at BDONE and at admission
         self.engine.auto_restore_hook = self._auto_par_restore
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -5194,6 +5215,15 @@ class Service:
         held = self.engine.slot_held[slot]
         if held and len(prompt) >= len(held) and prompt[:len(held)] == held:
             return                                          # the slot's live state is this conversation: keep it
+        if getattr(self, "slot_prefetch", False):
+            # Phase 6.3: the prefetch form - the engine answers RSTART after the file's header and layer
+            # index and loads the K/V on its own thread; this request's BGEN goes out at once and the
+            # admission's slot->main copy waits at each layer while the loader keeps reading ahead
+            r = self.engine.session_file("restore", path, slot, async_restore=True)
+            self.engine.slot_held[slot] = []
+            print(f"[strata] auto sessions (parallel): prefetch of auto-{key}.bin into slot {slot} started "
+                  f"({int(r.get('layers') or 0)} K/V layers); the request continues while it loads", flush=True)
+            return
         r = self.engine.session_file("restore", path, slot)   # EngineDied propagates: the request path restarts
         self.engine.slot_held[slot] = []
         print(f"[strata] auto sessions (parallel): restored {r.get('tokens')} tokens from auto-{key}.bin into "
@@ -8539,7 +8569,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         # missing shard or a plugin would break the promise the flag makes.
         env = child_env(cfg, offline=a.offline)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
-        configure_slot_overlap_env(env, cfg)
+        slot_prefetch_on = configure_slot_overlap_env(env, cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -8756,9 +8786,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             print("[strata] auto_sessions is on, but slot_save_path is not set: auto sessions stay off", flush=True)
         else:
             svc.auto_sessions = True
+            svc.slot_prefetch = bool(slot_prefetch_on)   # the engine was armed for the ASYNC restores (main's env above)
             print(f"[strata] auto sessions on: keep {svc.auto_sessions_keep} files, at most "
                   f"{svc.auto_sessions_max_gb:g} GB, from {svc.auto_sessions_min_tokens} prompt tokens "
-                  f"(auto-*.bin in {svc.slot_save_path})", flush=True)
+                  f"(auto-*.bin in {svc.slot_save_path})"
+                  + ("; restores go through the engine's prefetch form" if svc.slot_prefetch else ""), flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

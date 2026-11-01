@@ -18,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, Service, StrataEngine, configure_slot_overlap_env  # noqa: E402
+from serve.server import (ByteTokenizer, Service, SessionRefused, StrataEngine,  # noqa: E402
+                          configure_slot_overlap_env)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,8 +61,14 @@ class SlotProc:
             Path(path).write_bytes(b"x" * 1234)
             self.engine.lines.put("SAVED 1000 1234 40.1\n")
         else:
+            async_form = path.endswith(" ASYNC")
+            if async_form:
+                path = path[:-6]
             if not Path(path).exists():
                 self.engine.lines.put("SERR invalid 0 session file: not a session file\n")
+                return
+            if async_form:
+                self.engine.lines.put("RSTART 3 1234\n")   # Phase 6.3: the prefetch form's whole answer
                 return
             self.engine.lines.put("RESTORED 1000 1234 55.2\n")
 
@@ -290,6 +297,63 @@ class SlotOverlapEnv(unittest.TestCase):
             env = {}
             configure_slot_overlap_env(env, {"auto_sessions": True, "parallel": n})
             self.assertNotIn("STRATA_SESSION_OVERLAP", env)
+
+    def test_parallel_auto_sessions_arm_the_prefetch_too(self):
+        env = {}
+        self.assertTrue(configure_slot_overlap_env(env, {"auto_sessions": True, "parallel": 3}))
+        self.assertEqual(env.get("STRATA_SESSION_PREFETCH"), "1")
+
+    def test_the_prefetch_is_cleared_with_the_overlap(self):
+        env = {"STRATA_SESSION_PREFETCH": "1"}       # inherited: the server owns the switch
+        self.assertFalse(configure_slot_overlap_env(env, {"auto_sessions": True, "parallel": 1}))
+        self.assertNotIn("STRATA_SESSION_PREFETCH", env)
+
+
+class SlotPrefetch(unittest.TestCase):
+    """Phase 6.3 commit 3: the server's prefetch form - when the engine was armed (STRATA_SESSION_PREFETCH=1
+    at the start), the admission's restore sends `RESTORE SLOT <n> <path> ASYNC`, takes RSTART as the whole
+    answer and moves on (the request's BGEN); an unarmed engine keeps the synchronous form."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.engine = SlotEngine()
+        self.svc = Service(self.engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.slot_save_path = self.dir.name
+        self.svc.auto_sessions = True
+        self.engine.fresh()
+
+    def file(self, key):
+        return Path(self.dir.name, f"auto-{key}.bin")
+
+    def test_armed_engine_sends_the_async_form_and_moves_on(self):
+        self.svc.slot_prefetch = True
+        self.svc.auto_tls.key = "convp"
+        self.file("convp").write_bytes(b"x" * 10)
+        self.engine.slot_held[0] = []
+        self.svc._auto_par_restore(0, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent,
+                         [f"RESTORE SLOT 0 {self.dir.name}{os.sep}auto-convp.bin ASYNC\n"])
+        self.assertEqual(self.engine.slot_held[0], [])
+
+    def test_unarmed_engine_keeps_the_synchronous_form(self):
+        self.svc.slot_prefetch = False
+        self.svc.auto_tls.key = "convs"
+        self.file("convs").write_bytes(b"x" * 10)
+        self.engine.slot_held[0] = []
+        self.svc._auto_par_restore(0, [1, 2, 3])
+        self.assertEqual(self.engine.proc.sent,
+                         [f"RESTORE SLOT 0 {self.dir.name}{os.sep}auto-convs.bin\n"])
+
+    def test_async_refusal_maps_like_a_sync_one(self):
+        self.svc.slot_prefetch = True
+        self.svc.auto_tls.key = "convx"
+        self.file("convx").write_bytes(b"x" * 10)
+        self.engine.slot_held[0] = []
+        self.engine.slot_fail[0] = "the slot's session is still loading (a prefetch restore holds it)"
+        with self.assertRaises(SessionRefused):
+            self.svc._auto_par_restore(0, [1, 2, 3])
+        self.assertIn("ASYNC", self.engine.proc.sent[0])
 
 
 if __name__ == "__main__":

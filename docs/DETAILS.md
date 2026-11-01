@@ -1425,7 +1425,10 @@ thread ~5 s after BDONE - the save takes the engine's control lines like an admi
 slot has been re-admitted in the meantime (the live slot then beats the file) - and an incoming request whose
 conversation has a file, picked for a slot that holds no live copy of it, gets the file restored into that slot on
 its admission's control lines before its `BGEN`, so the engine continues from the saved state instead of re-reading
-the history. `manifest.json` (key -> tokens, bytes, saved time) tracks what is on disk; the same
+the history. With `parallel` ≥ 2 the engine is started with `STRATA_SESSION_PREFETCH=1` and the restore goes out
+as `RESTORE SLOT <n> <path> ASYNC` (Phase 6.3): the engine answers `RSTART <layers> <bytes>` once the file's
+header and layer index are read and loads the K/V layers on its own thread — the request's `BGEN` goes out at
+once, and the admission's slot→main copy waits at each layer while the loader reads ahead. `manifest.json` (key -> tokens, bytes, saved time) tracks what is on disk; the same
 `auto_sessions_keep` / `auto_sessions_max_gb` pruning applies. A queued save is drained at a normal stop, best
 effort. The server checks
 every line: a malformed or unknown one, counts that are negative or go back, an allowance outside 1..3600 or a time
