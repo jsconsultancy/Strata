@@ -29,6 +29,7 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/host_reserve.hpp"
+#include "strata/core/host_ledger.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1283,6 +1284,19 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
     if (!mem) return "RAM telemetry unavailable";
     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
 }
+
+// the host ledger's staging ticket for the session handlers: the save/restore copies are promised
+// while they run (a concurrent admission sampling mid-copy sees them coming), and the ticket is
+// closed however the handler leaves — refuse/continue, an exception, the happy path.  Id 0 unless
+// STRATA_HOST_LEDGER is on, so off this is a no-op pair of calls.
+struct LedgerTicketGuard {
+    uint64_t t;
+    explicit LedgerTicketGuard(uint64_t bytes) : t(strata::core::host_ledger_ticket_open(bytes)) {}
+    void grow(uint64_t bytes) { strata::core::host_ledger_ticket_resize(t, bytes); }
+    ~LedgerTicketGuard() { strata::core::host_ledger_ticket_close(t); }
+    LedgerTicketGuard(const LedgerTicketGuard&) = delete;
+    LedgerTicketGuard& operator=(const LedgerTicketGuard&) = delete;
+};
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
@@ -2999,6 +3013,13 @@ int main(int argc, char** argv) {
                              (double) mem->mem_available / GiB,
                              mib > 0 ? (", --memory-limit-mib " + std::to_string((long long) mib)).c_str() : "",
                              (long long) o.conversation_cache_min_free_mib);
+                if (strata::core::host_ledger_env()) {
+                    const auto room = strata::core::host_ledger_admission_available(std::optional<uint64_t>(mem->available));
+                    std::fprintf(stderr, "strata generate: host ledger: room %.1f GiB (the sample minus the page reserve, "
+                                         "the open tickets (%llu MiB) and the margin)\n",
+                                 room ? (double) *room / GiB : 0.0,
+                                 (unsigned long long) (strata::core::host_ledger_ticket_bytes() >> 20));
+                }
             }
         }
     }
@@ -4130,7 +4151,9 @@ int main(int argc, char** argv) {
             const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
             const bool allowed = auto_ram == nullptr || std::atoi(auto_ram) != 0;
             const uint64_t need = ple_table.table_bytes();
-            const auto available = strata::core::available_host_bytes();
+            // the host ledger's room: the sample minus the page reserve, the open tickets and the
+            // margin (the raw sample when STRATA_HOST_LEDGER is off)
+            const auto available = strata::core::host_ledger_admission_available(strata::core::available_host_bytes());
             uint64_t experts_ram = 0;   // every routed expert's blob: the arena the engine copies into RAM at start
             {
                 const auto& elay = strata::kernels::cpu::expert_layout();
@@ -5976,10 +5999,17 @@ int main(int argc, char** argv) {
         // The arena pins until the OS refuses; on Windows that leaves no page-locked memory for the small buffers the
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
+        // The host ledger prices the pin while it lands: the arbiter says what it could not free
+        // (advisory — the pin proceeds exactly as before), and the ticket holds the ask for the
+        // admissions that sample while the pin is still crossing.
+        if (strata::core::host_ledger_env())
+            (void) strata::core::host_ledger_admit(pin_limit, 0, "the expert arena pin");
+        const uint64_t arena_ticket = strata::core::host_ledger_ticket_open(pin_limit);
         strata::core::pin_reserve_take();
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                                              o.shared_expert_arena);
         strata::core::pin_note_arena(arena_src.pinned_arena_bytes());
+        strata::core::host_ledger_ticket_close(arena_ticket);
         strata::core::pin_sim_report("after the expert arena");
         strata::core::pin_reserve_release_soft();
         if (!arena_ok) {
@@ -7702,7 +7732,10 @@ int main(int argc, char** argv) {
         const int64_t extra_slots = std::max<int64_t>(0, lend_slots(16384) - lend_slots(8192));
         const uint64_t extra_mib = ((uint64_t) extra_slots * strata::kernels::cpu::expert_layout().max_blob) >> 20;
         const auto hm = strata::core::sample_host_memory();   // the cgroup / --memory-limit-mib cap counts too
-        const uint64_t avail_mib = hm ? hm->available >> 20 : mem_sample().avail_mib;
+        // the host ledger's room when it is on (the raw sample when off)
+        const uint64_t avail_mib = hm ? strata::core::host_ledger_admission_available(std::optional<uint64_t>(hm->available))
+                                          .value_or(hm->available) >> 20
+                                      : mem_sample().avail_mib;
         // --resident-experts pins its RAM copy after this point, and that copy also holds the lent slots' experts: what
         // has to fit is every expert the cache does not hold plus the 16384 loan (R9700 IQ3_XXS: 23.35 GiB at 16384)
         uint64_t pin_mib = 0;
@@ -7847,9 +7880,12 @@ int main(int argc, char** argv) {
         if (total == 0 || gpu_cache_bytes >= total) return chunk;   // the GPU holds every expert: no file tier
         const auto hm = strata::core::sample_host_memory();
         if (!hm) return chunk;
+        // the host ledger's room when it is on (the raw sample when off)
+        const uint64_t host_avail = strata::core::host_ledger_admission_available(std::optional<uint64_t>(hm->available))
+                                        .value_or(hm->available);
         const uint64_t slack = 1200ull << 20;   // MemAvailable overstates what the cache can hold (~1 GiB on the #2824 box)
         pp::Host host;
-        host.page_cache = src.unbuffered() ? 0 : (hm->available > slack ? hm->available - slack : 0);
+        host.page_cache = src.unbuffered() ? 0 : (host_avail > slack ? host_avail - slack : 0);
         host.h2d_gbps = g_last_h2d_gbps > 0.0 ? g_last_h2d_gbps : 12.0;
         std::string why;
         host.ssd_gbps = drive_read_gbps(o.native_preset.empty() ? o.pack : o.native_preset, why);   // where the experts live
@@ -8477,12 +8513,16 @@ int main(int argc, char** argv) {
             MEMORYSTATUSEX cs{};
             cs.dwLength = sizeof cs;
             if (GlobalMemoryStatusEx(&cs)) {
+                const uint64_t open_tickets = strata::core::host_ledger_ticket_bytes();   // 0 when the ledger is off
                 const uint64_t planned = (o.prompt_cache > 0 ? (uint64_t) std::max<int64_t>(o.conversation_cache_mib, 0) << 20 : 0) +
-                                         (2ull << 30);   // checkpoints and prompt staging
+                                         (2ull << 30) + open_tickets;   // checkpoints, prompt staging, the tickets still open
                 const auto cv = strata::platform::host_limits::commit_verdict((uint64_t) cs.ullAvailPageFile,
                                                                               (uint64_t) cs.ullTotalPageFile, planned, 4ull << 30);
                 std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)\n",
                              (double) cs.ullAvailPageFile / 1073741824.0, (double) cs.ullTotalPageFile / 1073741824.0);
+                if (open_tickets != 0)
+                    std::fprintf(stderr, "strata serve: host ledger: %llu MiB of open tickets are priced into that verdict\n",
+                                 (unsigned long long) (open_tickets >> 20));
                 if (cv.warn) std::fprintf(stderr, "strata serve: %s\n", cv.text.c_str());
             }
         }
@@ -9437,8 +9477,26 @@ int main(int argc, char** argv) {
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
+        size_t cache_budget = o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0;
+        // the host ledger sheds cache slots when the room cannot cover the planned asks (the low-commit start reaches
+        // READY by this shed instead of a mid-serve failure); off, the budget is exactly the flag's
+        if (cache_budget > 0 && strata::core::host_ledger_env()) {
+            if (const auto mem = strata::core::sample_host_memory()) {
+                const uint64_t room = strata::core::host_ledger_admission_available(std::optional<uint64_t>(mem->available))
+                                          .value_or(0);
+                const uint64_t planned = 2ull << 30;   // checkpoints and prompt staging, as the commit verdict prices them
+                const uint64_t eff = strata::core::host_ledger_effective_cache_budget(cache_budget, room, planned);
+                if (eff < cache_budget) {
+                    std::fprintf(stderr, "strata serve: host ledger: conversation cache %zu -> %zu MiB (room %zu MiB, "
+                                         "%llu MiB planned beside it)%s\n",
+                                 cache_budget >> 20, (size_t) (eff >> 20), (size_t) (room >> 20),
+                                 (unsigned long long) (planned >> 20), eff == 0 ? "; parking is off" : "");
+                    cache_budget = (size_t) eff;
+                }
+            }
+        }
         strata::core::ConversationCache conversations(
-            o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+            cache_budget,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
@@ -9652,9 +9710,10 @@ int main(int argc, char** argv) {
                 std::optional<strata::core::HostMemoryReading> mem;
                 auto admit = [&] {
                     mem = strata::core::sample_host_memory();
-                    // the page reserve: a running prompt's priced file streaming is not up for grabs
+                    // the page reserve: a running prompt's priced file streaming is not up for grabs; the host
+                    // ledger's tickets and margin come out of the same room when it is on (off: identical)
                     return strata::core::conversation_memory_admit(
-                        strata::core::host_reserve_admission_available(
+                        strata::core::host_ledger_admission_available(
                             mem ? std::optional<uint64_t>(mem->available) : std::nullopt),
                         additional, floor);
                 };
@@ -9688,7 +9747,7 @@ int main(int argc, char** argv) {
                 }
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
-                        strata::core::host_reserve_admission_available(
+                        strata::core::host_ledger_admission_available(
                             mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt),
                         0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
@@ -11336,6 +11395,14 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+        if (strata::core::host_ledger_env()) {
+            const auto mem = strata::core::sample_host_memory();
+            const auto room = strata::core::host_ledger_admission_available(
+                mem ? std::optional<uint64_t>(mem->available) : std::nullopt);
+            std::fprintf(stderr, "strata serve: host ledger: at READY the room is %s MiB, %llu MiB in open tickets\n",
+                         room ? std::to_string(*room >> 20).c_str() : "unknown",
+                         (unsigned long long) (strata::core::host_ledger_ticket_bytes() >> 20));
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -12419,11 +12486,17 @@ int main(int argc, char** argv) {
                                              freed.checkpoints, freed.parked, freed.bytes);
                             }
                         }
+                        // the host ledger: the save's staging is promised while it runs (a concurrent admission
+                        // sampling mid-save sees it coming); closed however the handler leaves; 0-held off
+                        LedgerTicketGuard save_ticket(sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
                         auto admit = [&](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = strata::core::host_reserve_admission_available(
+                            const std::optional<uint64_t> avail = strata::core::host_ledger_admission_available(
                                 mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
-                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) {
+                                save_ticket.grow(need);   // the parse firms the staging promise up as it goes
+                                return true;
+                            }
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                                   " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
@@ -12501,17 +12574,23 @@ int main(int argc, char** argv) {
                     // process, where the tables do not matter
                     auto return_lease = [&] { if (overlap && keep[0]) bslot_ss[0][(std::size_t) slot] = std::move(keep[0]); };
                     try {
+                        // the host ledger: the parse's arrays are promised as they are admitted (a concurrent
+                        // admission sampling mid-read sees them coming); closed however the handler leaves; 0-held off
+                        LedgerTicketGuard restore_ticket(0);
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
                         // file size follows from them.  The RAM the parse needs at its peak is asked first.
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                        limits.admit = [floor, &o, &restore_ticket](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = strata::core::host_reserve_admission_available(
+                            const std::optional<uint64_t> avail = strata::core::host_ledger_admission_available(
                                 mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
-                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) {
+                                restore_ticket.grow(need);   // the parse firms the staging promise up as it goes
+                                return true;
+                            }
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
                                   ram_note(mem) + ")";

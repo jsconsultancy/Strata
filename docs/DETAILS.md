@@ -1467,6 +1467,25 @@ With the flag off no ticket opens, the counter stays 0, and every admission is b
 `host_reserve_test` covers the tickets, the subtraction, the growth cap and the closes; the cold-cache 19K
 prompt A/B is the deploy-window gate.
 
+**The host ledger** (`STRATA_HOST_LEDGER=1`, opt-in, the InferSSD memory-governance idea) gives every host-RAM
+admission one room figure instead of each site sampling the OS and applying its own scattered margin:
+room = sample − page-reserve holds − ledger tickets − margin (the margin is `STRATA_HOST_LEDGER_MARGIN_MIB`,
+512 MiB by default, headroom for the consumers nobody prices). The tickets promise large allocations while they
+are still in flight — the window a fresh sample photographs badly: the expert arena's pin opens one sized to its
+pin limit, and the session save/restore hold their staging (`LedgerTicketGuard`, grown as the parse firms the
+estimate up, closed however the handler leaves). The four serving admissions (both park gates, the save, the
+restore) read the room through the seam `host_ledger_admission_available`, which when the ledger is off is
+exactly the page reserve's subtraction; the startup sites that size things from RAM — the PLE residency
+admission, the gfx12 16384-chunk ceiling, the prefill host plan — price themselves from the same room, the
+commit verdict adds the open tickets to its planned figure, and the conversation cache is shed to
+min(configured, room − 2 GiB planned) at construction (0 disables parking) — the "frees cache slots" half of a
+low-commit start. When an admission comes up short the arbiter (`host_ledger_admit`) runs registered reclaimers
+(caches that give RAM back on demand) and credits the freed bytes at once (a fresh sample lags the kernel); a
+start under commit pressure — the measured 3.2 GiB free that dies at `cublasCreate` — is the acceptance, a
+deploy-window A/B. Off: no ids, an empty registry, and every site is byte-identical to before.
+`host_ledger_test` runs both modes (the flag is read once, so on is its own `--on` process): the arithmetic,
+the ticket lifecycle, the registry order, the reclaim-then-credit recheck and the cache-shed rule.
+
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
 the draft layer's K/V. Format v1, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
 compile): a 64-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config

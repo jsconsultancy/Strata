@@ -142,6 +142,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(host_reserve_test src/core/host_reserve_test.cpp src/core/host_reserve.cpp)
   target_include_directories(host_reserve_test PRIVATE include)
   add_test(NAME host_reserve_test COMMAND host_reserve_test)
+  # the host ledger: one room figure for every host admission (sample - holds - tickets - margin)
+  add_executable(host_ledger_test src/core/host_ledger_test.cpp src/core/host_ledger.cpp src/core/host_reserve.cpp src/core/conversation_memory.cpp)
+  target_include_directories(host_ledger_test PRIVATE include)
+  add_test(NAME host_ledger_test COMMAND host_ledger_test)
+  add_test(NAME host_ledger_test_on COMMAND host_ledger_test --on)   # the flag is read once: on is its own process
   # the PLE residency rule (table + expert arena + headroom); header-only, needs nothing
   add_executable(ple_residency_test src/core/ple_residency_test.cpp)
   target_include_directories(ple_residency_test PRIVATE include)
@@ -621,7 +626,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/host_reserve.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/host_reserve.cpp
+    src/core/host_ledger.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
