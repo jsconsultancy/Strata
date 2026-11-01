@@ -1499,6 +1499,14 @@ count), the payload hash and the end marker `STRSEND\x01`. The hash is a 64-bit 
 not the standard XXH64 stream; it detects accidental corruption and does not authenticate a file: restore only files
 this engine wrote. An unknown version is refused; a new format gets a new version number.
 
+The resumable reader (`SessionReader`, Phase 6.3's prefetch) parses the same bytes in phases: `open` checks the
+header, identity and size, runs the RAM preflight and parses the payload's head (geometry through the checkpoints);
+`index_layers` walks only the K/V section's length prefixes positionally (each layer is one contiguous byte range,
+its five part lengths read, never the bytes); `next_layer` reads one layer's five parts and feeds the whole-payload
+hash exactly as the synchronous parse feeds it; `finish` checks the trailer. The integrity contract is the
+synchronous read's: a layer handed out before `finish` is exactly as trustworthy as the `layer_ready` hook's, and
+the file is trusted when it ends, not before. The synchronous `session_file_read` is untouched.
+
 A file is bound to the model inputs and to the settings that change what the saved bytes mean. The model fingerprint
 samples (size, first and last MiB) every file the engine loads, by its role: the GGUF shards (also
 `--native-dense-gguf`, the head shards and `--embd-gguf`), the PLE shard, the pack's index/dense/embedding files and

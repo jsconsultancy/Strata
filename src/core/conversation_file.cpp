@@ -764,7 +764,19 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+// the K/V layer's 7-field header, shared by the synchronous parse and the resumable reader
+bool get_kv_header(In& in, ConversationKv& k) {
+    int64_t format = 0;
+    if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+        !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+    if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+    k.format = (int) format;
+    return true;
+}
+
+// the payload's head: geometry through the checkpoints (everything before the K/V layers).  The reader's
+// open() stops here; get_payload carries on into the layers.
+bool get_payload_head(In& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -782,15 +794,17 @@ bool get_payload(In& in, SavedConversation& s) {
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    return true;
+}
+
+bool get_payload(In& in, SavedConversation& s) {
+    if (!get_payload_head(in, s)) return false;
+    uint64_t n = 0;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
+        if (!get_kv_header(in, k)) return false;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
         // PHASE 6.3 OVERLAP: the layer is complete here, so the engine's hook transfers it host -> device while
@@ -1180,18 +1194,9 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
-    error.clear();
-    st = {};
-    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
-    uint64_t size = 0;
-    if (!raw.open_session(path, size)) {
-        st.error = raw.refused() ? SessionError::invalid : raw.kind();
-        error = "session file: " + path + ": " + raw.error();
-        return false;
-    }
+// the size bounds every read applies after the open (the minimum is the header plus the trailer; the maximum
+// is the caller's limits and a size_t)
+bool check_read_size(uint64_t size, const SessionReadLimits& limits, std::string& error) {
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
     const uint64_t max_size = session_read_max_file_bytes(limits);
     if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
@@ -1199,15 +1204,16 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
         return false;
     }
-    FileSource f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
-    // installed before the first block (the header's) is read: every block reports, the first one included
-    if (limits.progress) f.progress.emplace(limits.progress);
-    f.expected = size;
-    uint8_t h[kHeader];
-    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    return true;
+}
+
+// the header's field checks once its 64 bytes are in hand (the synchronous read pumps them through its block
+// window so the first progress report fires; the resumable reader reads them positionally): fields, magic,
+// checksum, version, identity, payload length.  `payload` comes back for the parse.
+bool check_header(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint64_t& payload,
+                  std::string& error) {
     uint32_t version = 0, hsize = 0;
-    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
@@ -1222,6 +1228,31 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 std::to_string(kHeader + payload + kTrailer) + ")";
         return false;
     }
+    return true;
+}
+
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: " + path + ": " + raw.error();
+        return false;
+    }
+    if (!check_read_size(size, limits, error)) return false;
+    FileSource f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+    // installed before the first block (the header's) is read: every block reports, the first one included
+    if (limits.progress) f.progress.emplace(limits.progress);
+    f.expected = size;
+    uint8_t h[kHeader];
+    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    uint64_t payload = 0;
+    if (!check_header(h, size, id, payload, error)) return false;
     if (limits.admit) {
         std::string why;
         if (!limits.admit(session_read_peak_bytes(size), why)) {
@@ -1261,6 +1292,253 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+// ================================ THE RESUMABLE READER (Phase 6.3) ================================
+
+struct SessionReader::Impl {
+    RawFile raw;
+    SessionReadLimits limits;
+    uint64_t size = 0, payload = 0;
+    uint64_t cursor = 0;      // absolute file offset of the next byte next_layer() reads
+    uint64_t hashed = 0;      // payload bytes the hash has seen (the head parse + the layers read so far)
+    uint64_t kv_left = 0;     // layers left in the K/V section
+    size_t kv_index = 0;      // the next layer's index (its max_kv_bytes row)
+    SessionHasher hash{0};
+    bool indexed = false;
+    SessionError kind = SessionError::invalid;
+    std::string error;
+
+    bool fail(std::string& into, const std::string& m) {
+        if (error.empty()) error = "session file: " + m;
+        into = error;
+        return false;
+    }
+    // one positional read that also feeds the whole-payload hash: the reader's In::raw
+    bool raw_at(uint64_t at, void* p, size_t c, std::string& into) {
+        if (c != 0 && !raw.read_at(at, static_cast<uint8_t*>(p), c)) {
+            kind = raw.kind();
+            return fail(into, "read error: " + raw.error());
+        }
+        hash.update(p, c);
+        hashed += c;
+        return true;
+    }
+    // the same per-part bound the synchronous parse checks before its allocation
+    bool part_limit(uint64_t layer, size_t part, uint64_t len, std::string& into) {
+        const uint64_t limit = layer < limits.max_kv_bytes.size() ? limits.max_kv_bytes[(size_t) layer][part]
+                                                                  : UINT64_MAX;
+        if (len > limit)
+            return fail(into, "element count " + std::to_string(len) + " exceeds this engine's limit " +
+                                  std::to_string(limit));
+        return true;
+    }
+};
+
+SessionReader::SessionReader() : impl_(new Impl) {}
+SessionReader::~SessionReader() = default;
+
+uint64_t SessionReader::file_bytes() const { return impl_->size; }
+uint64_t SessionReader::consumed() const { return impl_->hashed; }
+SessionError SessionReader::kind() const { return impl_->kind; }
+
+bool SessionReader::open(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
+                         std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+    SessionStatus st;
+    error.clear();
+    impl_->error.clear();
+    impl_->kind = SessionError::invalid;
+    impl_->limits = limits;
+    if (!impl_->raw.open_session(path, impl_->size)) {
+        st.error = impl_->raw.refused() ? SessionError::invalid : impl_->raw.kind();
+        impl_->kind = st.error;
+        error = "session file: " + path + ": " + impl_->raw.error();
+        if (status) *status = st;
+        return false;
+    }
+    if (!check_read_size(impl_->size, limits, error)) {
+        if (status) *status = st;
+        return false;
+    }
+    try {
+        // the payload's head through the block pump (the same In the synchronous parse uses); everything
+        // after this call is positional.  In owns its hasher by value, so the head's bytes are merged back
+        // into the reader's own hash below.
+        FileSource f(impl_->raw);
+        if (!f.ok()) {
+            impl_->kind = SessionError::memory;
+            error = "session file: " + f.error();
+            if (status) *status = st;
+            return false;
+        }
+        if (limits.progress) f.progress.emplace(limits.progress);
+        f.expected = impl_->size;
+        uint8_t h[kHeader];
+        if (!f.read(h, kHeader)) {
+            impl_->kind = f.kind();
+            st.error = impl_->kind;
+            error = "session file: header read error: " + f.error();
+            if (status) *status = st;
+            return false;
+        }
+        uint64_t payload = 0;
+        if (!check_header(h, impl_->size, id, payload, error)) {
+            if (status) *status = st;
+            return false;
+        }
+        if (limits.admit) {
+            std::string why;
+            if (!limits.admit(session_read_peak_bytes(impl_->size), why)) {
+                impl_->kind = SessionError::memory;
+                st.error = SessionError::memory;
+                error = "session file: " + why;
+                if (status) *status = st;
+                return false;
+            }
+        }
+        impl_->payload = payload;
+        In in{&f, impl_->hash, payload, payload, error, limits};
+        if (!get_payload_head(in, meta)) {
+            impl_->kind = in.kind;
+            st.error = in.kind;
+            if (status) *status = st;
+            return false;
+        }
+        impl_->hash = in.hash;             // the head's bytes counted here too
+        impl_->cursor = kHeader + in.consumed();
+        impl_->hashed = in.consumed();
+    } catch (const std::bad_alloc&) {
+        impl_->kind = SessionError::memory;
+        st.error = SessionError::memory;
+        error = "session file: out of memory while reading " + path;
+        if (status) *status = st;
+        return false;
+    }
+    // the K/V count, with the bounds In::count applies (96 bytes is one layer's minimum)
+    uint64_t n = 0;
+    if (!impl_->raw_at(impl_->cursor, &n, 8, error)) {
+        if (status) status->error = impl_->kind;
+        return false;
+    }
+    impl_->cursor += 8;
+    const uint64_t left = impl_->payload - impl_->hashed;
+    if (n > left / 96 || n > (uint64_t) std::numeric_limits<size_t>::max() / 96) {
+        impl_->fail(error, "element count exceeds the payload");
+        if (status) status->error = SessionError::invalid;
+        return false;
+    }
+    if (n > limits.max_kv_layers) {
+        impl_->fail(error, "element count " + std::to_string(n) + " exceeds this engine's limit " +
+                               std::to_string(limits.max_kv_layers));
+        if (status) status->error = SessionError::invalid;
+        return false;
+    }
+    impl_->kv_left = n;
+    st.error = SessionError::none;
+    if (status) *status = st;
+    return true;
+}
+
+bool SessionReader::index_layers(std::vector<LayerIndex>& out, bool draft_expected, std::string& error) {
+    error.clear();
+    out.clear();
+    uint64_t at = impl_->cursor;   // the walk reads ahead; next_layer's cursor only moves in next_layer
+    const uint64_t payload_end = kHeader + impl_->payload;
+    for (uint64_t k = 0; k < impl_->kv_left; ++k) {
+        LayerIndex li;
+        li.offset = at;
+        uint8_t hdr[56];
+        if (!impl_->raw.read_at(at, hdr, sizeof hdr)) {
+            impl_->kind = impl_->raw.kind();
+            return impl_->fail(error, "read error: " + impl_->raw.error());
+        }
+        int64_t fields[7];
+        std::memcpy(fields, hdr, sizeof fields);
+        if (fields[0] < INT32_MIN || fields[0] > INT32_MAX) return impl_->fail(error, "invalid K/V format");
+        li.format = (int) fields[0];
+        li.cells = fields[1]; li.heads = fields[2]; li.head_dim = fields[3];
+        li.page_size = fields[4]; li.pooled_rows = fields[5]; li.idx_dim = fields[6];
+        at += sizeof hdr;
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t len = 0;
+            if (!impl_->raw.read_at(at, reinterpret_cast<uint8_t*>(&len), 8)) {
+                impl_->kind = impl_->raw.kind();
+                return impl_->fail(error, "read error: " + impl_->raw.error());
+            }
+            at += 8;
+            if (!impl_->part_limit(k, part, len, error)) {
+                impl_->kind = SessionError::invalid;
+                return false;
+            }
+            if (len > payload_end || at + len > payload_end || at + len < at)
+                return impl_->fail(error, "payload ends early");
+            li.part_bytes[part] = len;
+            at += len;
+        }
+        out.push_back(li);
+    }
+    if (!out.empty()) out.back().draft = draft_expected;
+    impl_->indexed = true;
+    return true;
+}
+
+bool SessionReader::next_layer(ConversationKv& layer, std::string& error) {
+    error.clear();
+    if (!impl_->indexed) return impl_->fail(error, "next_layer before index_layers");
+    if (impl_->kv_left == 0) return false;   // the section is done: finish() is next (no error)
+    ConversationKv k;
+    uint8_t hdr[56];
+    if (!impl_->raw_at(impl_->cursor, hdr, sizeof hdr, error)) return false;
+    int64_t fields[7];
+    std::memcpy(fields, hdr, sizeof fields);
+    if (fields[0] < INT32_MIN || fields[0] > INT32_MAX) return impl_->fail(error, "invalid K/V format");
+    k.format = (int) fields[0];
+    k.cells = fields[1]; k.heads = fields[2]; k.head_dim = fields[3];
+    k.page_size = fields[4]; k.pooled_rows = fields[5]; k.idx_dim = fields[6];
+    impl_->cursor += sizeof hdr;
+    ConversationBuffer* parts[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+    for (size_t part = 0; part < 5; ++part) {
+        uint64_t len = 0;
+        if (!impl_->raw_at(impl_->cursor, &len, 8, error)) return false;
+        impl_->cursor += 8;
+        if (!impl_->part_limit(impl_->kv_index, part, len, error)) {
+            impl_->kind = SessionError::invalid;
+            return false;
+        }
+        ConversationBuffer& b = *parts[part];
+        b = {};
+        b.resize((size_t) len);
+        uint64_t at = impl_->cursor;
+        b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) {
+            if (!impl_->raw_at(at, p, c, error)) return false;
+            at += c;
+            return true;
+        });
+        if (!error.empty()) return false;
+        impl_->cursor = at;
+    }
+    --impl_->kv_left;
+    ++impl_->kv_index;
+    layer = std::move(k);
+    return true;
+}
+
+bool SessionReader::finish(std::string& error) {
+    error.clear();
+    if (impl_->hashed != impl_->payload)
+        return impl_->fail(error, "payload has " + std::to_string(impl_->payload - impl_->hashed) +
+                                      " unparsed bytes");
+    // the trailer is not payload: it is checked against the digest, never fed into it
+    uint8_t t[kTrailer];
+    if (!impl_->raw.read_at(kHeader + impl_->payload, t, kTrailer)) {
+        impl_->kind = impl_->raw.kind();
+        return impl_->fail(error, "trailer read error: " + impl_->raw.error());
+    }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != impl_->hash.digest()) return impl_->fail(error, "payload checksum mismatch");
+    if (std::memcmp(t + 8, kEnd, 8) != 0) return impl_->fail(error, "bad end marker");
+    return true;
 }
 
 } // namespace strata::core

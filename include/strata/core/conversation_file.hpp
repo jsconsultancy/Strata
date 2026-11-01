@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -241,6 +242,60 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// The resumable reader (Phase 6.3's prefetch): the same parse as session_file_read, split so the header,
+// identity and RAM preflight answer first and the K/V layers come one at a time, for a caller that hands each
+// to the device while it keeps reading.  Host-only, like the rest of this file.  open() parses the payload's
+// head (geometry, layer range, the live state, the checkpoints) into `meta` and walks nothing else;
+// index_layers() reads only the K/V section's length prefixes; next_layer() positionally reads one layer's
+// five parts (the hash is fed exactly as the synchronous parse feeds it, byte for byte); finish() checks the
+// trailer.  The integrity contract is the synchronous read's: a layer handed out early is exactly as
+// trustworthy as the layer_ready hook's - every payload byte is hashed and the whole-payload checksum plus end
+// marker are verified only by finish(), so the file is trusted when it ends, not before.
+class SessionReader {
+public:
+    SessionReader();
+    ~SessionReader();
+    SessionReader(const SessionReader&) = delete;
+    SessionReader& operator=(const SessionReader&) = delete;
+
+    // Opens the file (no link at the name, one link, ordinary file), checks header checksum, version,
+    // identity and size against `id`/`limits`, runs the RAM preflight (`limits.admit`) and parses the
+    // payload's head into `meta`.  False: `error` says why and `status->error` (when given) its kind;
+    // no other call may follow.
+    bool open(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta, std::string& error,
+              const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
+    // One K/V layer as the file holds it: its header fields and the absolute offset of each part.
+    struct LayerIndex {
+        int format = 0;
+        int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+        uint64_t offset = 0;                  // the layer's first byte in the file (its 7-field header)
+        std::array<uint64_t, 5> part_bytes{}; // k, v, k_scale, v_scale, pooled: length prefix included in none
+        bool draft = false;                   // the caller's say-so (the engine knows whether it saved one)
+    };
+
+    // Walks the K/V section's length prefixes with positional reads (small reads, no payload allocation) and
+    // returns the layers in file order.  `draft_expected` names the last layer the draft when the file has
+    // one.  The layer count is checked against SessionReadLimits::max_kv_layers, every part length against
+    // max_kv_bytes, exactly as the synchronous parse checks them.
+    bool index_layers(std::vector<LayerIndex>& out, bool draft_expected, std::string& error);
+
+    // The next layer's five parts, read positionally into `layer` (its buffers resized), each byte hashed in
+    // file order.  False when the section is done (call finish()) or on an error (`error` says which).
+    bool next_layer(ConversationKv& layer, std::string& error);
+
+    // The trailer: whole-payload checksum and end marker.  True is what makes every handed-out layer trusted.
+    bool finish(std::string& error);
+
+    uint64_t file_bytes() const;   // the file's size, from the open
+    uint64_t consumed() const;     // payload bytes hashed so far
+    SessionError kind() const;     // the failure's kind for the caller's status mapping
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

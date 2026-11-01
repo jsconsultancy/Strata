@@ -809,6 +809,91 @@ int main() {
     }
 #endif
 
+    // ---- the resumable reader (Phase 6.3): the same parse, split at the K/V layers ----
+    {
+        const fs::path p = dir / "reader.bin";
+        check(session_file_write(p.string(), original, id, written, error), "reader: write succeeds");
+        const size_t payload = written - 80;   // the header (64) plus the trailer (16)
+
+        SessionReader r;
+        SavedConversation meta, parsed = original;
+        parsed.kv.clear();
+        check(r.open(p.string(), id, meta, error), (std::string("reader: open succeeds: ") + error).c_str());
+        check(same_checkpoint(meta.live, original.live) && meta.checkpoints.size() == original.checkpoints.size(),
+              "reader: the head parse matches");
+        check(r.file_bytes() == written && r.consumed() < payload, "reader: the file size and a partial consume");
+
+        std::vector<SessionReader::LayerIndex> index;
+        check(r.index_layers(index, /*draft_expected=*/true, error), "reader: the index walk succeeds");
+        check(index.size() == original.kv.size(), "reader: every layer indexed");
+        check(!index.empty() && index.back().draft && !index.front().draft, "reader: the draft flag lands on the last layer");
+        uint64_t at = index.empty() ? 0 : index.front().offset;
+        bool sizes_ok = index.size() == original.kv.size(), offsets_ok = true;
+        for (size_t i = 0; i < index.size(); ++i) {
+            const auto& kv = original.kv[i];
+            sizes_ok = sizes_ok && index[i].format == kv.format && index[i].cells == kv.cells &&
+                       index[i].heads == kv.heads && index[i].head_dim == kv.head_dim &&
+                       index[i].page_size == kv.page_size && index[i].pooled_rows == kv.pooled_rows &&
+                       index[i].idx_dim == kv.idx_dim &&
+                       index[i].part_bytes[0] == kv.k.size() && index[i].part_bytes[1] == kv.v.size() &&
+                       index[i].part_bytes[2] == kv.k_scale.size() && index[i].part_bytes[3] == kv.v_scale.size() &&
+                       index[i].part_bytes[4] == kv.pooled.size();
+            if (i) offsets_ok = offsets_ok && index[i].offset == at;
+            at = index[i].offset + 56;
+            for (size_t part = 0; part < 5; ++part) at += 8 + index[i].part_bytes[part];
+        }
+        check(sizes_ok, "reader: the index reads each layer's header and part sizes");
+        check(offsets_ok && at == written - 16, "reader: the walk's end is the payload's end (the trailer's offset)");
+
+        for (size_t i = 0; i < index.size(); ++i) {
+            ConversationKv layer;
+            check(r.next_layer(layer, error), (std::string("reader: layer read ") + std::to_string(i) + ": " + error).c_str());
+            parsed.kv.push_back(std::move(layer));
+        }
+        ConversationKv done;
+        check(!r.next_layer(done, error) && error.empty(), "reader: a next_layer past the end is a quiet done");
+        check(r.finish(error), (std::string("reader: finish verifies the checksum: ") + error).c_str());
+        check(r.consumed() == payload, "reader: every payload byte was hashed");
+        check(same(original, parsed), "reader: the layered parse is the synchronous parse");
+
+        // corruption that keeps every length right: the verdict waits for finish(), exactly as the doc says
+        auto image = slurp(p);
+        const size_t mid = image.size() / 2;
+        image[mid] = uint8_t(image[mid] ^ 0x40);
+        const fs::path flipped = dir / "flipped.bin";
+        spit(flipped, image);
+        SessionReader r2;
+        SavedConversation meta2;
+        check(r2.open(flipped.string(), id, meta2, error), "reader: the flipped byte opens (sizes still true)");
+        std::vector<SessionReader::LayerIndex> index2;
+        check(r2.index_layers(index2, false, error), "reader: the flipped byte indexes");
+        bool flipped_ok = true;
+        for (size_t i = 0; i < index2.size(); ++i) {
+            ConversationKv layer;
+            flipped_ok = flipped_ok && r2.next_layer(layer, error);
+        }
+        check(flipped_ok, "reader: the flipped byte is handed out like a good layer");
+        check(!r2.finish(error) && error.find("checksum") != std::string::npos,
+              "reader: finish refuses the flipped byte (payload checksum mismatch)");
+
+        // a truncated file dies in open(): the header's payload length no longer matches the size
+        const std::vector<char> whole = slurp(p);
+        spit(dir / "short.bin", std::vector<char>(whole.begin(), whole.begin() + (written - 100)));
+        SessionReader r3;
+        SavedConversation meta3;
+        check(!r3.open((dir / "short.bin").string(), id, meta3, error) &&
+              error.find("does not match the header") != std::string::npos, "reader: a truncated file is refused in open");
+
+        // a wrong geometry refuses before any state array is read, as the synchronous parse does
+        SessionReadLimits limits;
+        limits.geometry = original.geometry;
+        limits.geometry->at(0) += 1;
+        SessionReader r4;
+        SavedConversation meta4;
+        check(!r4.open(p.string(), id, meta4, error, limits) && error.find("geometry") != std::string::npos,
+              "reader: another geometry is refused in open");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);
     return 0;
