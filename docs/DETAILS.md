@@ -1431,6 +1431,26 @@ effort. The server checks
 every line: a malformed or unknown one, counts that are negative or go back, an allowance outside 1..3600 or a time
 that is not a finite number end the engine as out of step.
 
+An idle batch slot's decoded conversation is parked before an admission overwrites it (upstream #2526): the main
+session was parked with the conversation's prompt only (the admission's copy), so when the next admission or a
+BYIELD read overwrote the slot, the reply the slot decoded lived nowhere — the conversation's next turn found its
+prompt-read state and read the whole reply again (measured on four 200K chats over two slots: 255 of a 256-token
+reply re-read). `park_slot` runs before `copy_to_slot` at a slot admission and before a BYIELD read overwrites a
+slot, through the same budget / RAM-admission / snapshot path as the main session's park (`park_source`); the
+retained K/V (#1503) is taken for the main session's park only, never a slot's. It does nothing when the live
+main session or a parked conversation already holds that state or a continuation of it
+(`ConversationCache::holds` / `conversation_covers`), for a slot with pictures, or without `--batch-mtp` when the
+drafter is on (an image without per-slot draft K/V would not restore beside the drafter). Parking is an
+optimization like a checkpoint (#3350): a skip, a failed snapshot, a failed device sync and a host allocation that
+runs out are logged and the slot is overwritten as before — nothing here ends the request or the engine. When a
+slot gives its state back at an admission its checkpoints come along (the shorter ones too, under a bad_alloc
+guard), so the chain keeps its branch points and the parked copies a turn back are superseded (#342) instead of
+taking an entry each. #4420: a slot's chain holds one checkpoint (its admission's), so parking it would drop, as
+superseded, the main session's richer copy of the same conversation — the root checkpoint at the end of an agent's
+system prompt among them, the one its sibling conversations borrow. `ConversationCache::supersedes_richer()` names
+that case and the slot stays unparked (as in 0.2.6): parking it measured 323 ms → 4130 ms for the next
+overlapping request's 5 K-token prefix.
+
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
 the draft layer's K/V. Format v1, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
 compile): a 64-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config
