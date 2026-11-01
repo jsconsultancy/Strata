@@ -12376,6 +12376,27 @@ int main(int argc, char** argv) {
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
+                    // PHASE 6.3 OVERLAP (STRATA_SESSION_OVERLAP=1; off by default keeps the read whole and the
+                    // transfer in one blocking step below): each parsed K/V layer goes host -> device while the
+                    // next one is read; the reader and the copies are the same engine thread, one operation on
+                    // the GPU at a time, so the serialized device order is exactly the serial restore's.  The
+                    // validation gate is per-layer and runs before that layer's first copy; a layer that fails
+                    // it stops the overlap and the device has seen nothing.  The file's own checks (identity,
+                    // bounds, payload checksum, trailer) are unchanged and all land before the state fields
+                    // below are touched.
+                    std::atomic<int> overlap_done{0};      // diagnostics: K/V layers restored as they parsed
+                    const bool overlap = slot_mode && !batch_mtp && [] {
+                        const char* v = std::getenv("STRATA_SESSION_OVERLAP"); return v != nullptr && v[0] == '1';
+                    }();
+                    const std::size_t overlap_layers =
+                        (overlap && slot < (int) bslot_ss.size() && !bslot_ss[0].empty())
+                            ? (std::size_t) std::max<int64_t>(bslot_ss[0][(std::size_t) slot]->qsa_alloc, 0) : 0;
+                    std::vector<std::unique_ptr<strata::core::SessionState>> keep;   // the slot's state, leased out
+                    std::vector<std::pair<int, std::string>> overlap_errs;           // (layer, reason), at most two
+                    bool overlap_live = false;                                       // a copy has touched the device
+                    // every refusal path that keeps the engine alive returns the lease; the FATAL paths end the
+                    // process, where the tables do not matter
+                    auto return_lease = [&] { if (overlap && keep[0]) bslot_ss[0][(std::size_t) slot] = std::move(keep[0]); };
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
@@ -12398,43 +12419,154 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        if (overlap) {
+                            // the slot's session state is leased out of the live table at once (the admission hook
+                            // serializes us against this slot's BGEN: no batch worker sees the table during the
+                            // read); the per-layer copies write into the leased state; the commit installs it back
+                            keep.push_back(std::move(bslot_ss[0][(std::size_t) slot]));
+                            limits.layer_ready = [&](const strata::core::ConversationKv& layer, std::size_t idx,
+                                                     bool draft, uint64_t) {
+                                std::string e;
+                                // the per-layer gate before any device write (the same call restore makes).  With
+                                // --batch-mtp off a slot has no draft layer, so `draft` says the file is not this
+                                // slot's - it refuses like a layer that fails its own gate.
+                                if (draft) {
+                                    if (overlap_errs.size() < 2)
+                                        overlap_errs.emplace_back((int) idx, "this slot has no draft layer for the file");
+                                    return;
+                                }
+                                if (idx >= keep.size() || keep[0] == nullptr ||
+                                    idx >= (std::size_t) std::max<int64_t>(keep[0]->qsa_alloc, 0)) {
+                                    if (overlap_errs.size() < 2)
+                                        overlap_errs.emplace_back((int) idx, "the file has more K/V layers than this slot");
+                                    return;
+                                }
+                                strata::core::QsaState& target = keep[0]->qsa_states[keep[0]->qsa_ord0 + (int64_t) idx];
+                                if (!strata::core::conversation_kv_validate(layer, target, g,
+                                                                            (int64_t) image.live.ids.size(), true, e)) {
+                                    if (overlap_errs.size() < 2) overlap_errs.emplace_back((int) idx, e);
+                                    return;
+                                }
+                                overlap_live = true;
+                                if (!strata::core::conversation_kv_restore(layer, target, g,
+                                                                           (int64_t) image.live.ids.size(), true, e) &&
+                                    overlap_errs.size() < 2)
+                                    overlap_errs.emplace_back((int) idx, e);
+                                overlap_done.fetch_add(1);
+                            };
+                            limits.tail = [&](uint64_t) { blocking("transfer", bytes); };
+                        }
                         strata::core::SessionStatus st;
                         if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                            if (overlap && overlap_live && overlap_errs.size() < 2)
+                                overlap_errs.emplace_back(-1, "the file failed after the device state was changed");
+                            return_lease();
                             refuse(err, st.error);
                             continue;
                         }
                     } catch (const std::bad_alloc&) {
+                        return_lease();
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                         continue;
                     }
                     const double read_ms = ms();
-                    // the whole image against this engine, still without any device write
+                    if (overlap) {
+                        if (overlap_done.load() != (int) overlap_layers)
+                            overlap_errs.emplace_back(-1, "the file ended after " + std::to_string(overlap_done.load()) +
+                                                          " K/V layers, not the " + std::to_string(overlap_layers) +
+                                                          " this slot restores");
+                        if (!overlap_errs.empty()) {
+                            const std::string why = overlap_errs[0].second +
+                                (overlap_errs.size() > 1 ? " ; " + overlap_errs[1].second : std::string());
+                            if (overlap_live) {   // the contract: never decode from a half-written state
+                                std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n",
+                                             path.c_str(), why.c_str());
+                                std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                            why.c_str());
+                                std::fflush(stdout);
+                                return 1;
+                            }
+                            refuse(why);
+                            return_lease();
+                            continue;
+                        }
+                    }
+                    // the whole image against this engine, still without any device write.  In the overlap path the
+                    // slot's states are taken out while the read runs, so the whole-image gate runs against fresh
+                    // clones of them: it checks the file's identity, extents and buffer sizes, and the clone's
+                    // buffers are the same mapped pools the restored states will use.
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, *ssp, g,
-                                                                      (const strata::core::QsaState*) draftp, err)) {
+                    std::vector<std::unique_ptr<strata::core::SessionState>> gate;
+                    const bool whole_ok = overlap
+                        ? strata::core::conversation_snapshot_validate(
+                              image,
+                              *strata::core::conversation_session_clone_for_validate(*keep[0], gate),
+                              g, (const strata::core::QsaState*) draftp, err)
+                        : strata::core::conversation_snapshot_validate(image, *ssp, g,
+                                                                       (const strata::core::QsaState*) draftp, err);
+                    if (!whole_ok) {
+                        if (overlap && overlap_live) {   // the K/V is already on the device: the restore contract
+                            std::fprintf(stderr, "strata serve: session restore slot %d %s: transfer failed: %s\n",
+                                         slot, path.c_str(), err.c_str());
+                            std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                        err.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        return_lease();
                         refuse(err);
                         continue;
                     }
-                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's
+                    // cells (one global elastic region; a slot's states share it, as the plain restore assumed)
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
-                        refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
+                        if (overlap && overlap_live) {
+                            std::fprintf(stderr, "strata serve: session restore slot %d %s: transfer failed: "
+                                                 "the K/V cannot grow to the saved conversation\n", slot, path.c_str());
+                            std::printf("FATAL restoring the session file failed after the device state was changed: "
+                                        "the K/V cannot grow to the saved conversation\n");
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        return_lease();
+                        refuse("the K/V cannot grow to the saved conversation: no VRAM is left",
+                               strata::core::SessionError::memory);
                         continue;
                     }
                     if (!slot_mode) conversations.take_reuse();   // retained K/V described the outgoing session
                     if (!slot_mode) live_ok = false;
-                    // host -> device in synchronous copies of the whole state: one bounded allowance
-                    blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, *ssp, g,
-                                                                    (const strata::core::QsaState*) draftp, err) !=
-                        strata::core::ConversationRestore::restored) {
-                        // validated above: a failure here is a transfer failure, after device writes began - never
-                        // decode from a partial state; the server starts the engine again
-                        std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),
-                                     err.c_str());
-                        std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
-                                    err.c_str());
-                        std::fflush(stdout);
-                        return 1;
+                    if (overlap) {
+                        // the K/V already went to the device as the file was read, into the slot's states taken
+                        // out at the read's start; the running state is the one step left (its sizes were checked
+                        // by the whole-image validate above, and a checkpoint restore writes the state whole)
+                        blocking("state", (1 + (std::size_t) image.checkpoints.size()) * (64u << 20));
+                        const std::string slot_tag = " slot " + std::to_string(slot);
+                        if (!strata::core::conversation_checkpoint_restore(image.live, *keep[0], g, err)) {
+                            std::fprintf(stderr, "strata serve: session restore%s %s: transfer failed: %s\n",
+                                         slot_tag.c_str(), path.c_str(), err.c_str());
+                            std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                        err.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        // the lease ends here: the slot's state goes back, whole and restored, and the slot's
+                        // fields are set in the same step (the control lines are ours until `continue`)
+                        bslot_ss[0][(std::size_t) slot] = std::move(keep[0]);
+                    } else {
+                        // host -> device in synchronous copies of the whole state: one bounded allowance
+                        blocking("transfer", bytes);
+                        if (strata::core::conversation_snapshot_restore(image, *ssp, g,
+                                                                        (const strata::core::QsaState*) draftp, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            // validated above: a failure here is a transfer failure, after device writes began - never
+                            // decode from a partial state; the server starts the engine again
+                            std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),
+                                         err.c_str());
+                            std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                        err.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
                     }
                     const size_t tok_n = (size_t) image.live.ids.size();
                     if (slot_mode) {

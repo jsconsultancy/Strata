@@ -520,6 +520,46 @@ int main() {
         l.admit = [](uint64_t, std::string& why) { why = "no RAM"; return false; };
         check(!session_file_read(good.string(), id, back, n, error, l, &st) && st.error == SessionError::memory,
               "status: the RAM preflight is 'memory'");
+        // PHASE 6.3 OVERLAP: the per-layer hook fires on complete layers, in order, the draft named last, and the
+        // tail fires once the payload verified - the parsed image is exactly the unhooked read's
+        {
+            std::vector<std::pair<size_t, bool>> seen;
+            std::vector<uint64_t> marks;
+            int tails = 0;
+            auto lo = exact();
+            lo.layer_ready = [&](const ConversationKv& k, size_t idx, bool draft, uint64_t consumed) {
+                seen.emplace_back(idx, draft);
+                marks.push_back(consumed);
+                check(k.k.size() == original.kv[idx].k.size() && k.v.size() == original.kv[idx].v.size() &&
+                      k.pooled.size() == original.kv[idx].pooled.size(), "overlap: the layer is complete when reported");
+            };
+            lo.tail = [&](uint64_t) { ++tails; };
+            SavedConversation hook_back;
+            size_t hn = 0;
+            check(session_file_read(good.string(), id, hook_back, hn, error, lo) && same(hook_back, original),
+                  "overlap: the hooked read returns the same image");
+            check(seen.size() == 3 && seen[0] == std::make_pair(size_t(0), false) &&
+                  seen[1] == std::make_pair(size_t(1), false) && seen[2] == std::make_pair(size_t(2), true),
+                  "overlap: every layer reported once, in order, the draft layer named as the draft");
+            check(marks.size() == 3 && marks[0] < marks[1] && marks[1] < marks[2] && marks[2] < image.size(),
+                  "overlap: the consumed payload bytes grow with the layers and stay inside the payload");
+            check(tails == 1, "overlap: the tail fires once, after the file verified");
+            // the hooks run while the payload is being read: a bad file fires them and the read still fails,
+            // the tail never fires (the engine's overlap contract: nothing reaches the commit)
+            auto d = image;
+            d[64 + 8 + 1000 * 4 + 8 + 16 + 4099 + 8 + 77 + 8 + 301 + 8 + 64 + 8 + 8 + 8 + 16 + 1] ^= 0x40;   // a state byte
+            const fs::path p = dir / "hookfail.bin";
+            spit(p, d);
+            seen.clear(); marks.clear(); tails = 0;
+            check(!session_file_read(p.string(), id, hook_back, hn, error, lo), "overlap: a bad file fails the hooked read");
+            check(tails == 0, "overlap: the tail does not fire when the file fails");
+            // a layer the limits cap mid-file: the hook sees the layers before the refusal, the read refuses
+            lo = exact();
+            lo.max_kv_layers = 2;
+            seen.clear(); marks.clear(); tails = 0;
+            check(!session_file_read(good.string(), id, hook_back, hn, error, lo), "overlap: a layer count over the cap refused");
+            check(seen.empty() && tails == 0, "overlap: the count refusal lands before any layer is parsed");
+        }
     }
     // R3/R5: injected failures at each write step - kind, publication and the old file
     {

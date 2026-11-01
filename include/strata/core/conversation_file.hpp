@@ -222,6 +222,13 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // PHASE 6.3 OVERLAP (the engine with STRATA_SESSION_OVERLAP=1, off by default): after each K/V layer is parsed
+    // (its buffers complete, its header fields filled; `bytes` = payload bytes consumed so far), the caller may
+    // transfer that layer host -> device while the next layer is being read.  The layer is the unit the file
+    // checksum covers, so reporting a layer early costs nothing in integrity.  The payload is then read as one
+    // straight run and `tail` reports the trailer's bytes at the end.  A callback that throws is not caught here.
+    std::function<void(const ConversationKv& layer, size_t index, bool draft, uint64_t bytes)> layer_ready;
+    std::function<void(uint64_t bytes)> tail;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

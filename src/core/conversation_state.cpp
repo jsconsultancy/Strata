@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
 
 namespace strata::core {
 namespace {
@@ -406,6 +407,16 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
+
+const SessionState* conversation_session_clone_for_validate(const SessionState& live,
+                                                             std::vector<std::unique_ptr<SessionState>>& keep) {
+    // Phase 6.3: a shallow shell of a session whose real states are taken out (the overlapped slot restore holds
+    // them in `keep` while it restores them).  SessionState is all pointers to arenas the engine owns, so the
+    // shell keeps the same carve, the same QsaState objects and the same pools; validate reads carve arithmetic,
+    // buffer sizes and pool pointers, never the payload, and makes no device call.  The shell lives in `keep`.
+    keep.push_back(std::make_unique<SessionState>(live));
+    return keep.back().get();
+}
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {

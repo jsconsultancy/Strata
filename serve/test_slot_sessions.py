@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, Service, StrataEngine  # noqa: E402
+from serve.server import ByteTokenizer, Service, StrataEngine, configure_slot_overlap_env  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -261,6 +261,35 @@ class ParallelAutoSessions(unittest.TestCase):
         self.svc._auto_par_note(1)
         time.sleep(0.3)
         self.assertEqual(self.engine.proc.sent, [])
+
+
+class SlotOverlapEnv(unittest.TestCase):
+    """PHASE 6.3: the engine's STRATA_SESSION_OVERLAP is set at the engine start exactly for the config that
+    uses it - auto sessions on batch slots ("auto_sessions" + "parallel": N>=2); everything else is left
+    without it, including a stale one the caller inherited."""
+
+    def test_parallel_auto_sessions_enable_it(self):
+        env = {}
+        configure_slot_overlap_env(env, {"auto_sessions": True, "parallel": 3})
+        self.assertEqual(env.get("STRATA_SESSION_OVERLAP"), "1")
+
+    def test_solo_auto_sessions_do_not(self):
+        for cfg in ({"auto_sessions": True}, {"auto_sessions": True, "parallel": 1},
+                    {"auto_sessions": True, "parallel": 0}):
+            env = {}
+            configure_slot_overlap_env(env, cfg)
+            self.assertNotIn("STRATA_SESSION_OVERLAP", env)
+
+    def test_parallel_without_auto_sessions_does_not(self):
+        env = {"STRATA_SESSION_OVERLAP": "1"}        # inherited: the server owns the switch
+        configure_slot_overlap_env(env, {"parallel": 3})
+        self.assertNotIn("STRATA_SESSION_OVERLAP", env)
+
+    def test_a_non_number_parallel_is_inert(self):
+        for n in ("3", True, None, 2.0):
+            env = {}
+            configure_slot_overlap_env(env, {"auto_sessions": True, "parallel": n})
+            self.assertNotIn("STRATA_SESSION_OVERLAP", env)
 
 
 if __name__ == "__main__":

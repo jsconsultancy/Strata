@@ -930,6 +930,18 @@ def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -
         env.pop("STRATA_BATCH_TELEMETRY", None)
 
 
+def configure_slot_overlap_env(env: dict, cfg: dict) -> None:
+    """PHASE 6.3: with parallel auto sessions (the config's "auto_sessions" and "parallel": N>=2), the engine
+    restores a slot's conversation with each K/V layer going host -> device while the next one is read (its
+    RESTORE SLOT path, STRATA_SESSION_OVERLAP=1; the engine reads the variable on every restore, and --batch-mtp
+    disables the overlap in the engine).  An engine that does not know the variable ignores it."""
+    par = cfg.get("parallel")
+    if cfg.get("auto_sessions") and isinstance(par, int) and not isinstance(par, bool) and par >= 2:
+        env["STRATA_SESSION_OVERLAP"] = "1"
+    else:
+        env.pop("STRATA_SESSION_OVERLAP", None)
+
+
 def parse_batch_window_sample(line: str) -> dict | None:
     """Read an opt-in engine BSTAT sample; rows are verifier work, not emitted tokens."""
     if len(line) > 80:
@@ -8462,6 +8474,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         # missing shard or a plugin would break the promise the flag makes.
         env = child_env(cfg, offline=a.offline)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
+        configure_slot_overlap_env(env, cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())

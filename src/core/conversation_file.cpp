@@ -712,10 +712,12 @@ struct In {
     FileSource* f;
     SessionHasher hash;
     uint64_t left;
+    uint64_t payload = 0;                                   // for consumed(): the bytes of the payload read so far
     std::string& error;
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    uint64_t consumed() const { return payload - left; }
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
@@ -791,6 +793,13 @@ bool get_payload(In& in, SavedConversation& s) {
         k.format = (int) format;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
+        // PHASE 6.3 OVERLAP: the layer is complete here, so the engine's hook transfers it host -> device while
+        // the next layer is read.  The payload is then read as one straight run: the checksum and the trailer
+        // check below are unchanged.  The draft layer (the last, when the file has one: `max_kv_layers` odd) is
+        // the one `draft` names.
+        if (in.limits.layer_ready)
+            in.limits.layer_ready(k, in.kv_layer, (in.limits.max_kv_layers & 1u) != 0 && in.kv_layer + 1 == n,
+                                  in.consumed());
     }
     return true;
 }
@@ -1222,7 +1231,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         }
     }
     SavedConversation parsed;
-    In in{&f, SessionHasher(0), payload, error, limits};
+    In in{&f, SessionHasher(0), payload, payload, error, limits};   // left = payload remaining, payload = its total
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -1231,6 +1240,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (limits.tail) limits.tail(size);       // overlap: the reader is done and the file verified
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;

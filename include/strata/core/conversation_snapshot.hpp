@@ -5,6 +5,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <memory>
 #include <string>
 
 namespace strata::core {
@@ -110,6 +111,11 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
+// PHASE 6.3: a shell SessionState for whole-image validation while the real states are leased out for an overlapped
+// slot restore (see the engine's STRATA_SESSION_OVERLAP path).  The shell shares the session's carve, states and
+// pools; validate reads sizes and pointers only, never payload, and makes no device call.  The shell lives in `keep`.
+const SessionState* conversation_session_clone_for_validate(const SessionState& live,
+                                                             std::vector<std::unique_ptr<SessionState>>& keep);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
