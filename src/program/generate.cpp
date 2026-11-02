@@ -11581,6 +11581,8 @@ int main(int argc, char** argv) {
             std::unique_ptr<strata::core::SessionState> leased;   // the slot's state, leased out while loading
             strata::core::SavedConversation meta;                 // the file's head: the live state, the checkpoints
             std::thread th;                                       // joined by the loop thread (finish or QUIT)
+            uint64_t ticket = 0;   // the ledger's promise for the loader's staging (largest layer + margin),
+                                   // opened at RSTART, closed wherever the thread is joined
         };
         struct BSlot {
             bool active = false, stop = false;
@@ -11765,6 +11767,7 @@ int main(int argc, char** argv) {
             load->cv.wait(lk, [&] { return load->done; });
             lk.unlock();
             if (load->th.joinable()) load->th.join();
+            if (load->ticket) { strata::core::host_ledger_ticket_close(load->ticket); load->ticket = 0; }
             const bool complete = !load->cancel && !load->failed && load->landed >= load->total;
             const std::string from = " from " + std::to_string(load->meta.live.ids.size()) + " file tokens";
             if (complete) {
@@ -12419,6 +12422,7 @@ int main(int argc, char** argv) {
                         { std::lock_guard<std::mutex> lk(load->mu); load->cancel = true; }
                         load->cv.notify_all();
                         if (load->th.joinable()) load->th.join();
+                        if (load->ticket) { strata::core::host_ledger_ticket_close(load->ticket); load->ticket = 0; }
                     }
                 break;
             }
@@ -12707,6 +12711,8 @@ int main(int argc, char** argv) {
                     // touched is FATAL, exactly as the overlap restore's.
                     if (!session_prefetch_env()) { refuse("RESTORE SLOT ASYNC needs STRATA_SESSION_PREFETCH=1"); continue; }
                     if (batch_mtp) { refuse("the prefetch restore does not support --batch-mtp"); continue; }
+                    std::shared_ptr<SlotLoad> load;   // outside the try: the catch restores the lease if the
+                                                      // thread constructor throws after the state was leased
                     try {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
@@ -12728,7 +12734,7 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         auto reader = std::make_unique<strata::core::SessionReader>();
-                        auto load = std::make_shared<SlotLoad>();
+                        load = std::make_shared<SlotLoad>();
                         strata::core::SessionStatus st;
                         if (!reader->open(path, id, load->meta, err, limits, &st)) { refuse(err, st.error); continue; }
                         std::vector<strata::core::SessionReader::LayerIndex> index;
@@ -12743,6 +12749,16 @@ int main(int argc, char** argv) {
                         load->total = 1 + (int) index.size();
                         const int64_t upto = (int64_t) load->meta.live.ids.size();
                         const int64_t ord0 = load->leased->qsa_ord0;
+                        // the ledger's staging promise: the loader holds one layer image + margin in host
+                        // RAM at a time (sequential), priced so concurrent park/save admissions see it;
+                        // closed wherever the thread is joined (end_load, and the QUIT path)
+                        uint64_t layer_max = 0;
+                        for (const auto& li : index) {
+                            uint64_t lb = 0;
+                            for (uint64_t pb : li.part_bytes) lb += pb;
+                            layer_max = std::max(layer_max, lb);
+                        }
+                        load->ticket = strata::core::host_ledger_ticket_open(layer_max + (64u << 20));
                         std::fprintf(stderr, "strata serve: session prefetch started for slot %d: %zu K/V layers, "
                                      "%zu tokens, %llu bytes from %s\n", slot, index.size(),
                                      load->meta.live.ids.size(), (unsigned long long) reader->file_bytes(),
@@ -12811,6 +12827,13 @@ int main(int argc, char** argv) {
                         });
                         bs[(size_t) slot].load = load;   // published last: the loop thread sees a complete record
                     } catch (const std::bad_alloc&) {
+                        // the lease may already be moved into the load record (the thread constructor
+                        // decay-copies its captures and can throw after that): give it back, or the slot
+                        // is left with no state at all and the next admission dereferences null
+                        if (load && load->th.joinable()) load->th.join();
+                        if (load && load->ticket) { strata::core::host_ledger_ticket_close(load->ticket); load->ticket = 0; }
+                        if (load && load->leased && !bslot_ss[0][(size_t) slot])
+                            bslot_ss[0][(size_t) slot] = std::move(load->leased);
                         refuse("not enough RAM to start the session load", strata::core::SessionError::memory);
                         continue;
                     }
@@ -14762,7 +14785,9 @@ int main(int argc, char** argv) {
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    // a loading slot is excluded (Phase 6.3): its state is leased to the loader and
+                    // bslot_ss[0][ys] is null until the load lands - a BYIELD into it would crash
+                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active && !bs[(size_t) ys].load &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;
@@ -16701,11 +16726,13 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
-                if (cont && bs[(size_t) admit_slot].load) {
+                if (bs[(size_t) admit_slot].load) {
                     // Phase 6.3: this admission overwrites a slot whose prefetch is still loading (its file
-                    // prefix did not match this prompt) - the load's wait is worth less than the request;
-                    // abandon it (the loader stops at a layer boundary, the lease goes back, the slot is
-                    // empty as before the load)
+                    // prefix did not match this prompt), or the admission is failing past this point and
+                    // would orphan the load - either way abandon it now (the loader stops at a layer
+                    // boundary, the lease goes back, the slot is empty as before the load). Unconditional
+                    // on `cont`: a skipped abandon leaves bs[slot].load set forever (the slot poisons)
+                    // and the leased null state under the next copy_to_slot.
                     std::string e2;
                     if (!end_load(admit_slot, /*abandon=*/true, e2))
                         std::fprintf(stderr, "strata serve: session prefetch for slot %d abandoned at its admission "

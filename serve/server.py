@@ -8560,6 +8560,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    slot_prefetch_on = False   # armed by configure_slot_overlap_env below, for strata engines only
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
