@@ -68,7 +68,9 @@ class FatalRecovery(unittest.TestCase):
         try:
             def post():
                 req=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
-                with urllib.request.urlopen(req,timeout=5) as r:return r.read().decode()
+                # 60 s: the recovery request may span one restart retry (RESTART_RETRY_S=15) - a dying engine's
+                # VRAM takes a while to come back, and the restart's first try can fail once by design
+                with urllib.request.urlopen(req,timeout=60) as r:return r.read().decode()
             text=post()
             self.assertIn('"error"',text);self.assertTrue(text.rstrip().endswith('data: [DONE]'))
             with urllib.request.urlopen(base+'/health',timeout=5) as r:self.assertFalse(json.load(r)['loaded'])
