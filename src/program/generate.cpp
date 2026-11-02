@@ -12701,6 +12701,32 @@ int main(int argc, char** argv) {
                     // every refusal path that keeps the engine alive returns the lease; the FATAL paths end the
                     // process, where the tables do not matter
                     auto return_lease = [&] { if (overlap && keep[0]) bslot_ss[0][(std::size_t) slot] = std::move(keep[0]); };
+                // the restore's RAM admission and the limits build, ONE source of truth for the synchronous
+                // and the prefetch restore (they were two copies and drifted once): the ticket hook is the
+                // parameterized difference - the synchronous parse grows its LedgerTicketGuard as the
+                // estimate firms up; the prefetch's staging is priced by the loader's own ticket opened at
+                // RSTART, so its head parse runs without a grow hook
+                auto make_restore_limits = [&](strata::core::SessionReadLimits& limits,
+                                               LedgerTicketGuard* ticket, std::string& e) -> bool {
+                    limits.progress = moving;
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    limits.admit = [ticket, floor](uint64_t need, std::string& why) {
+                        const auto mem = strata::core::sample_host_memory();
+                        const std::optional<uint64_t> avail = strata::core::host_ledger_admission_available(
+                            mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
+                        if (strata::core::conversation_memory_admit(avail, need, floor)) {
+                            if (ticket) ticket->grow(need);
+                            return true;
+                        }
+                        why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                              std::to_string((long long) (floor >> 20)) + " MiB needed, " + ram_note(mem) + ")";
+                        return false;
+                    };
+                    // the draft state prices the limits' extra row (conversation_session_read_limits always
+                    // sizes layers + 1 - the +1 row is a draft-carrying file's last layer)
+                    return strata::core::conversation_session_read_limits(limits, *ssp, g, mtp.kv_state(),
+                        (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), e);
+                };
                 if (!save && slot_mode && async) {
                     // Phase 6.3: the prefetch restore. The header, identity, RAM preflight and the layer
                     // index run here (the slot's state is still in place for the limits), then the state is
@@ -12715,24 +12741,8 @@ int main(int argc, char** argv) {
                                                       // thread constructor throws after the state was leased
                     try {
                         strata::core::SessionReadLimits limits;
-                        limits.progress = moving;
-                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = strata::core::host_ledger_admission_available(
-                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
-                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
-                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
-                                  std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
-                                  ram_note(mem) + ")";
-                            return false;
-                        };
                         std::string lerr;
-                        // the draft state prices the limits' extra row, exactly as the synchronous restore
-                        // passes it (conversation_session_read_limits always sizes layers + 1 - the +1 row
-                        // is a draft-carrying file's last layer)
-                        if (!strata::core::conversation_session_read_limits(limits, *ssp, g, mtp.kv_state(),
-                                (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), lerr)) {
+                        if (!make_restore_limits(limits, nullptr, lerr)) {
                             refuse(lerr, strata::core::SessionError::io);
                             continue;
                         }
@@ -12855,24 +12865,7 @@ int main(int argc, char** argv) {
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
                         // file size follows from them.  The RAM the parse needs at its peak is asked first.
                         strata::core::SessionReadLimits limits;
-                        limits.progress = moving;
-                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        limits.admit = [floor, &o, &restore_ticket](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = strata::core::host_ledger_admission_available(
-                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt);   // the page reserve is not up for grabs
-                            if (strata::core::conversation_memory_admit(avail, need, floor)) {
-                                restore_ticket.grow(need);   // the parse firms the staging promise up as it goes
-                                return true;
-                            }
-                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
-                                  std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
-                                  ram_note(mem) + ")";
-                            return false;
-                        };
-                        if (!strata::core::conversation_session_read_limits(
-                                limits, *ssp, g, mtp.kv_state(), (uint64_t) o.max_context,
-                                (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                        if (!make_restore_limits(limits, &restore_ticket, err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
