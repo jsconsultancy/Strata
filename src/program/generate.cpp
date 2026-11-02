@@ -11140,6 +11140,10 @@ int main(int argc, char** argv) {
         };
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
+        // The ranked list is what lands on disk, so an unchanged list skips the write (the file is already
+        // exact): a steady workload re-wrote an identical multi-MB file every --expert-profile-save-every
+        // minutes for nothing.  Compared after the rank, before the write; stored only on a successful write.
+        std::vector<std::pair<int32_t, int32_t>> last_ranked;
         auto save_profile = [&](const char* why) {
             if (heat.empty()) return;
             std::vector<uint8_t> resident(host_res.size(), 0);
@@ -11150,10 +11154,16 @@ int main(int argc, char** argv) {
             std::string e;
             const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
                                                                    profile_loaded);
-            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+            if (!last_ranked.empty() && ranked == last_ranked) {
+                std::fprintf(stderr, "strata serve: expert profile unchanged (%s); the file is current\n", why);
+                profile_saved_at = Clock::now();
+                return;
+            }
+            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e)) {
+                last_ranked = ranked;
                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
                              why);
-            else
+            } else
                 std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
             profile_saved_at = Clock::now();
         };
