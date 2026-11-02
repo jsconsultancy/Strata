@@ -202,6 +202,19 @@ bool session_prefetch_env() {
     }();
     return on;
 }
+// the admission's per-layer wait bound for the ASYNC restore's loader (seconds; default 120, 0 = unbounded
+// as before): a condvar wait is not a GPU wait, so the watchdog never sees it - a wedged loader (a hung
+// read) would hold the loop thread at the layer forever.  At the bound the engine ends FATAL (never decode
+// from a half-written state, and the loader's H2D may be mid-flight on the default stream, so the lease
+// cannot go back) - a bounded, precisely-logged end instead of an unbounded silent one
+int64_t session_prefetch_wait_s() {
+    static const int64_t s = [] {
+        const char* v = std::getenv("STRATA_SESSION_PREFETCH_WAIT_S");
+        const long long n = v ? std::atoll(v) : 120;
+        return n > 0 ? (int64_t) n : 0;
+    }();
+    return s;
+}
 // STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
 // windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
 // the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
@@ -11748,9 +11761,42 @@ int main(int argc, char** argv) {
         // slot is empty as it was - the request falls back to reading its prompt from the start.
         auto wait_steps = [&](int b, int need, std::string& e) -> bool {
             SlotLoad& load = *bs[(size_t) b].load;
+            const auto t0 = Clock::now();
             std::unique_lock<std::mutex> lk(load.mu);
-            load.cv.wait(lk, [&] { return load.landed >= need || load.done || load.cancel || load.failed; });
-            if (load.landed >= need) return true;
+            bool ready;
+            if (session_prefetch_wait_s() > 0)
+                ready = load.cv.wait_for(lk, std::chrono::seconds(session_prefetch_wait_s()),
+                                         [&] { return load.landed >= need || load.done || load.cancel || load.failed; });
+            else {
+                load.cv.wait(lk, [&] { return load.landed >= need || load.done || load.cancel || load.failed; });
+                ready = true;
+            }
+            const long long waited_ms = (long long) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if (ready && load.landed >= need) {
+                // Gate E instrumentation: a wait worth saying (the loader normally reads ahead far enough
+                // that the admission never blocks; when it does, the line says where the tail time went)
+                if (waited_ms >= 250)
+                    std::fprintf(stderr, "strata serve: session prefetch: the admission waited %lld ms at slot %d "
+                                         "for step %d of %d (%d landed)\n", waited_ms, b, need, load.total, load.landed);
+                return true;
+            }
+            if (!ready) {
+                // the bound, not the loader's own word: the loader is wedged somewhere this condvar cannot
+                // see (a hung read).  The lease cannot go back (its H2D may be mid-flight on the default
+                // stream) and the state is half-written: the FATAL contract, with the precise cause.
+                std::fprintf(stderr, "strata serve: session prefetch: the admission's wait for step %d of %d at "
+                                     "slot %d hit the %lld s bound (STRATA_SESSION_PREFETCH_WAIT_S) with %d steps "
+                                     "landed - the loader looks wedged\n", need, load.total, b,
+                             session_prefetch_wait_s(), load.landed);
+                std::string one = "the session prefetch loader did not land step " + std::to_string(need) +
+                                  " of " + std::to_string(load.total) + " within " +
+                                  std::to_string(session_prefetch_wait_s()) + " s";
+                std::printf("FATAL %s\n", one.c_str());
+                std::fflush(stdout);
+                std::fflush(stderr);
+                strata::core::release_gpu_waits(stderr);
+                std::abort();
+            }
             e = load.failed ? "the session load failed: " + load.why
                             : "the session load ended before this layer";
             return false;
@@ -12827,6 +12873,13 @@ int main(int argc, char** argv) {
                                     std::abort();
                                 }
                                 land(1 + (int) i + 1);
+                                // progress at a quiet cadence (a 90-layer file says four lines): the load
+                                // takes seconds to minutes, and until now nothing between RSTART and the
+                                // admission's finish said where it was
+                                if ((i + 1) % 16 == 0 || i + 1 == index.size())
+                                    std::fprintf(stderr, "strata serve: session prefetch: %zu of %zu K/V layers "
+                                                 "(%.1f of %.1f GiB)\n", i + 1, index.size(),
+                                                 (double) reader->consumed() / 1e9, (double) reader->file_bytes() / 1e9);
                             }
                             // the whole-payload checksum: the verdict that makes every handed-out layer trusted
                             if (!reader->finish(lerr)) {
