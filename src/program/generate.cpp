@@ -12728,6 +12728,9 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         std::string lerr;
+                        // the draft state prices the limits' extra row, exactly as the synchronous restore
+                        // passes it (conversation_session_read_limits always sizes layers + 1 - the +1 row
+                        // is a draft-carrying file's last layer)
                         if (!strata::core::conversation_session_read_limits(limits, *ssp, g, mtp.kv_state(),
                                 (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), lerr)) {
                             refuse(lerr, strata::core::SessionError::io);
@@ -12740,7 +12743,11 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionReader::LayerIndex> index;
                         if (!reader->index_layers(index, /*draft_expected=*/false, err)) { refuse(err); continue; }
                         if (index.empty()) { refuse("the file holds no K/V layers"); continue; }
-                        if (index.back().draft) {
+                        // the limits always admit layers + 1 (the draft row), and index_layers names the
+                        // draft flag from the caller's expectation (false here, always) - so the real guard
+                        // is the slot's own capacity: a draft-carrying file has one layer more than this
+                        // slot owns, and the loader would write it past the leased state's QsaState array
+                        if ((int64_t) index.size() > ssp->qsa_alloc) {
                             refuse("the file holds a draft layer: restore it without the ASYNC form or with --batch-mtp");
                             continue;
                         }
