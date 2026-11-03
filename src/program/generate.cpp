@@ -11774,18 +11774,29 @@ int main(int argc, char** argv) {
         auto wait_steps = [&](int b, int need, std::string& e) -> bool {
             SlotLoad& load = *bs[(size_t) b].load;
             const auto t0 = Clock::now();
+            const int64_t bound_ms = session_prefetch_wait_s() * 1000;
             std::unique_lock<std::mutex> lk(load.mu);
-            bool ready;
-            if (session_prefetch_wait_s() > 0)
-                ready = load.cv.wait_for(lk, std::chrono::seconds(session_prefetch_wait_s()),
-                                         [&] { return load.landed >= need || load.done || load.cancel || load.failed; });
-            else {
-                load.cv.wait(lk, [&] { return load.landed >= need || load.done || load.cancel || load.failed; });
-                ready = true;
+            // the bound is NO-PROGRESS, not total time: every landed step resets the stall clock, so a
+            // large file loading steadily past 120 s (slow storage) never trips it - only a loader that
+            // lands nothing for the bound does (a wedged read)
+            int seen = load.landed;
+            auto stall = Clock::now();
+            bool stalled_out = false;
+            for (;;) {
+                if (load.landed >= need || load.done || load.cancel || load.failed) break;
+                if (bound_ms > 0) {
+                    const long long stalled = (long long) std::chrono::duration<double, std::milli>(
+                        Clock::now() - stall).count();
+                    if (stalled >= bound_ms) { stalled_out = true; break; }
+                    load.cv.wait_for(lk, std::chrono::milliseconds(bound_ms - stalled));
+                } else {
+                    load.cv.wait(lk);
+                }
+                if (load.landed != seen) { seen = load.landed; stall = Clock::now(); }
             }
             const long long waited_ms = (long long) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             load.waited_ms += waited_ms;   // the finish line's total (the mutex is held here)
-            if (ready && load.landed >= need) {
+            if (load.landed >= need) {
                 // Gate E instrumentation: a wait worth saying (the loader normally reads ahead far enough
                 // that the admission never blocks; when it does, the line says where the tail time went)
                 if (waited_ms >= 250)
@@ -11793,7 +11804,7 @@ int main(int argc, char** argv) {
                                          "for step %d of %d (%d landed)\n", waited_ms, b, need, load.total, load.landed);
                 return true;
             }
-            if (!ready) {
+            if (stalled_out) {
                 // the bound, not the loader's own word: the loader is wedged somewhere this condvar cannot
                 // see (a hung read).  The lease cannot go back (its H2D may be mid-flight on the default
                 // stream) and the state is half-written: the FATAL contract, with the precise cause.
