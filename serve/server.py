@@ -2244,10 +2244,11 @@ class StrataEngine:
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
         now, view = time.time(), []
-        for b in range(self.batch):
-            r = self.slot_live[b]
+        live, held = self.slot_live, self.slot_held    # a restart resizes both (and batch) mid-loop: iterate the
+        for b in range(min(self.batch, len(live), len(held))):   # snapshots, or /metrics could 500 on a shrink
+            r = live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "idle", "held_tokens": len(held[b])})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -3770,7 +3771,8 @@ def slot_filename_problem(name) -> str | None:
 
 def slot_save_dir(value, base: str | None = None) -> str:
     """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
-    directory), created private to this user when missing.  ValueError for anything else."""
+    directory), created when missing: mode 0o700 makes it private to this user on POSIX; Windows ignores that
+    mode and gives the folder its parent's inherited ACL.  ValueError for anything else."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("slot_save_path must be a directory path (a string)")
     if any(ord(c) < 32 for c in value):
@@ -4078,6 +4080,13 @@ class Service:
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path, slot_n)
+                    if action == "restore" and slot_n is not None:
+                        # the slot's live state is now the RESTORED conversation: drop the held list left over from
+                        # whatever the slot cached before it -- routing that matches a request against the stale
+                        # cache manufactured #1994-style refusals (the engine checks again and refuses the slot)
+                        self.engine.slot_held[slot_n] = []
+                        if getattr(self.engine, "slot_used", None) is not None:
+                            self.engine.slot_used[slot_n] = time.time()
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -5111,10 +5120,13 @@ class Service:
                     if (self.engine.gen == gen and self.engine.alive()
                             and not self.engine.slot_busy[slot] and self.engine.slot_held[slot] == held):
                         self._auto_par_save_locked(slot, key)
-                except Exception as e:
+                except Exception as e:                    # noqa: BLE001 - never block the stop
                     print(f"[strata] auto sessions (parallel): slot {slot} was not saved at shutdown: {e}",
                           flush=True)
                     break
+                finally:
+                    self.engine.ctl.release()             # was leaked on the break path above: the stop path
+                                                          # would leave the engine's control lines held
 
     def _auto_session_prune(self):
         """Keep the newest auto_sessions_keep files and at most auto_sessions_max_gb of them (0: no such limit).
@@ -5190,6 +5202,12 @@ class Service:
                 print(f"[strata] auto sessions (parallel): the save of slot {slot} ended the engine: {e}", flush=True)
             except (SessionRefused, ValueError, EngineSilent) as e:
                 print(f"[strata] auto sessions (parallel): slot {slot} was not saved: {e}", flush=True)
+            except Exception as e:                          # noqa: BLE001 - a worker death would end every later save
+                print(f"[strata] auto sessions (parallel): slot {slot} was not saved: {type(e).__name__}: {e}",
+                      flush=True)
+            finally:
+                self.engine.ctl.release()                   # was leaked when a save raised past the catches above:
+                                                            # every later admission then waited on the lines forever
 
     def _auto_par_save_locked(self, slot, key):
         path = os.path.join(self.slot_save_path, f"auto-{key}.bin")
@@ -5219,15 +5237,67 @@ class Service:
             # Phase 6.3: the prefetch form - the engine answers RSTART after the file's header and layer
             # index and loads the K/V on its own thread; this request's BGEN goes out at once and the
             # admission's slot->main copy waits at each layer while the loader keeps reading ahead
-            r = self.engine.session_file("restore", path, slot, async_restore=True)
+            try:
+                r = self.engine.session_file("restore", path, slot, async_restore=True)
+            except SessionRefused as e:
+                if "still loading" in str(e):
+                    # a second request for the same conversation arriving mid-load: the engine refuses the
+                    # double restore, and this request's own admission waits at the loader's per-layer gate
+                    # like any other - it must not fail, and it must not count toward the refusal tracker
+                    # (a large file loading past a minute would otherwise delete a good session file)
+                    print(f"[strata] auto sessions (parallel): a prefetch of auto-{key}.bin into slot {slot} "
+                          f"is already loading; this request continues on the same load", flush=True)
+                    self.engine.slot_held[slot] = []
+                    return
+                self._auto_par_restore_refused(key, slot, path, e)
+                return
             self.engine.slot_held[slot] = []
             print(f"[strata] auto sessions (parallel): prefetch of auto-{key}.bin into slot {slot} started "
                   f"({int(r.get('layers') or 0)} K/V layers); the request continues while it loads", flush=True)
             return
-        r = self.engine.session_file("restore", path, slot)   # EngineDied propagates: the request path restarts
+        try:
+            r = self.engine.session_file("restore", path, slot)   # EngineDied propagates: the request path restarts
+        except SessionRefused as e:
+            self._auto_par_restore_refused(key, slot, path, e)
+            return
         self.engine.slot_held[slot] = []
+        entry = self.auto_par_manifest.get(key)
+        if entry is not None:
+            entry.pop("refusals", None)               # a restore went through: the file is good, start over
+            entry.pop("refused_at", None)
         print(f"[strata] auto sessions (parallel): restored {r.get('tokens')} tokens from auto-{key}.bin into "
               f"slot {slot} in {float(r.get('ms') or 0):.0f} ms", flush=True)
+
+    def _auto_par_restore_refused(self, key, slot, path, e: SessionRefused):
+        """A refused restore used to be raised again on every turn: one bad file bricked the whole
+        conversation until it was deleted by hand.  A refusal is still raised -- the client sees the
+        engine's reason, and a transient one (a prefetch that still holds the slot) passes once it is
+        done -- but when the SAME file refuses again a minute apart it is never going to restore: it is
+        removed, and the request reads cold (what a missing file would do).  The minute keeps a good
+        file whose prefetch merely holds the slot (refusals seconds apart) from ever being deleted."""
+        self.engine.slot_held[slot] = []              # the slot's state is unknown now: the next read is a cold one
+        entry = self.auto_par_manifest.setdefault(key, {})
+        refusals = int(entry.get("refusals") or 0)
+        last = float(entry.get("refused_at") or 0.0)
+        now = time.time()
+        if refusals and now - last >= 60.0:
+            refusals += 1
+            if refusals >= 2:
+                entry.pop("refusals", None)
+                entry.pop("refused_at", None)
+                try:
+                    os.unlink(path)
+                    print(f"[strata] auto sessions (parallel): auto-{key}.bin refused a restore again ({e}); "
+                          f"it is removed and the request re-reads its prompt", flush=True)
+                except OSError as oe:
+                    print(f"[strata] auto sessions (parallel): auto-{key}.bin refused a restore again ({e}) and "
+                          f"could not be removed ({oe}); the request re-reads its prompt", flush=True)
+                return
+        elif not refusals:
+            refusals = 1
+        entry["refusals"] = refusals
+        entry["refused_at"] = now
+        raise e
 
     def _auto_par_manifest(self, key, tokens, bytes_):
         self.auto_par_manifest[key] = {"tokens": tokens, "bytes": bytes_, "saved": round(time.time(), 3)}
@@ -7065,6 +7135,9 @@ def make_handler(svc: Service):
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
+                if getattr(self, "answer_started", False):
+                    raise          # the SSE stream is out: a second response would only corrupt it (in-band
+                                   # error events have already covered the streaming paths)
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                            headers={"Retry-After": int(ra)} if ra else None)
@@ -7405,6 +7478,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except (GpuBusy, EngineStarting) as e:           # mid-stream (a give-way retry ran out): the
+                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 503 now
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -7508,6 +7585,8 @@ def make_handler(svc: Service):
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
+                self._responses_failed(asm, str(e), "server_error", send)
+            except (GpuBusy, EngineStarting) as e:           # mid-stream: the headers are sent, so no 503 now
                 self._responses_failed(asm, str(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
@@ -7632,6 +7711,10 @@ def make_handler(svc: Service):
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except (GpuBusy, EngineStarting) as e:           # mid-stream: the headers are sent, so no 503 now
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
@@ -8679,6 +8762,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
+        if len(groups) > 1:
+            _ipol = (cfg["images"].get("gpu_policy") or "auto")
+            if _ipol != "keep":
+                # shrink/unload decide from the thread-context replica and act on THAT
+                # replica's card, while sd-cli runs on the config's own GPU; and the
+                # images turn cannot take the replicas' control lines (each replica has
+                # its own).  keep is the one honest mode: no per-card decision is made.
+                raise SystemExit(f"[strata] config: images gpu_policy {_ipol!r} is not supported with "
+                                 f"{len(groups)} replicas: the VRAM decision would act on the wrong card. "
+                                 "Set \"gpu_policy\": \"keep\" (the job runs beside the engines, you own the "
+                                 "VRAM budget) or drop one of the two features")
+            print("[strata] images beside replicas: gpu_policy keep (no VRAM is made; you own the budget)", flush=True)
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
                     and not os.path.isabs(v) else v)

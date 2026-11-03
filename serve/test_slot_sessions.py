@@ -351,9 +351,21 @@ class SlotPrefetch(unittest.TestCase):
         self.file("convx").write_bytes(b"x" * 10)
         self.engine.slot_held[0] = []
         self.engine.slot_fail[0] = "the slot's session is still loading (a prefetch restore holds it)"
+        self.svc._auto_par_restore(0, [1, 2, 3])          # returns; no SessionRefused: this request
+        # continues on the same load (its admission waits at the loader's per-layer gate)
+        self.assertEqual(self.engine.slot_held[0], [])
+        self.assertIsNone(self.svc.auto_par_manifest.get("convx", {}).get("refusals"))
+
+    def test_a_real_async_refusal_still_raises_and_tracks(self):
+        self.svc.slot_prefetch = True
+        self.svc.auto_tls.key = "convy"
+        self.file("convy").write_bytes(b"x" * 10)
+        self.engine.slot_held[0] = []
+        self.engine.slot_fail[0] = "session file: geometry mismatch"
         with self.assertRaises(SessionRefused):
             self.svc._auto_par_restore(0, [1, 2, 3])
         self.assertIn("ASYNC", self.engine.proc.sent[0])
+        self.assertEqual(self.svc.auto_par_manifest["convy"]["refusals"], 1)
 
 
 if __name__ == "__main__":
