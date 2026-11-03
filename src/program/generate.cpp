@@ -11685,11 +11685,14 @@ int main(int argc, char** argv) {
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         // the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
-        // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
-        // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
+        // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split - and every
+        // slot admission here otherwise pushes the conversation's whole K/V through host RAM and back); each
+        // device is synchronized once before and once after.  DEFAULT ON since the copy path is complete with
+        // its own failure drain (a part-way copy syncs the legacy streams before the sessions are reused);
+        // STRATA_SLOT_COPY_DIRECT=0 forces the host image path (the A/B arm for the maintenance window).
         static const bool slot_copy_direct = [] {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
