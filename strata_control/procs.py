@@ -289,7 +289,18 @@ def end_one(record: dict, *, grace: float = 8.0, settle: float = 120.0, say=None
         drop_record(pid)
         return "gone"
     if not WINDOWS:
-        _signal_verified(record, signal.SIGTERM)
+        # a False here is a vanished process (is_same raced its exit) or a REFUSED
+        # signal (another account's leftover): waiting out grace+settle against an
+        # unsignalable process stalled every start by ~128 s, forever -- the EPERM
+        # answer is immediate, with the record kept (it is still there, truthfully)
+        if not _signal_verified(record, signal.SIGTERM):
+            if command_line(pid) is None:
+                drop_record(pid)
+                return "gone"
+            if say is not None:
+                say(f"[strata] the leftover process {pid} belongs to another account; end it "
+                    "yourself or run as that user")
+            return "stuck"
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline and is_same(pid, record["token"], record["cmd"]):
             time.sleep(0.1)
@@ -297,15 +308,31 @@ def end_one(record: dict, *, grace: float = 8.0, settle: float = 120.0, say=None
             _signal_verified(record, signal.SIGKILL)
     else:
         if is_same(pid, record["token"], record["cmd"]):
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)      # one PID, verified just above
+            r = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)  # one PID, verified just above
+            if r.returncode != 0 and say is not None:
+                why = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
+                say(f"[strata] taskkill {pid} failed: {why[:160]}")
+    # the settle predicate is NOT is_same on Windows: TerminateProcess sets the exit
+    # code at once, so start_token -> None and is_same -> False while the object --
+    # and the pinned memory its teardown is returning -- is still there (the wait
+    # never waited).  What #4051 wants gone is the process OBJECT.
+    if WINDOWS and record["token"].startswith("w:"):
+        from strata_control import winproc
+        created = int(record["token"][2:])
+
+        def still_there() -> bool:
+            return winproc.process_object_matches(pid, created)
+    else:
+        def still_there() -> bool:
+            return is_same(pid, record["token"], record["cmd"])
     deadline = time.monotonic() + settle
     next_beat = time.monotonic() + 10.0
-    while time.monotonic() < deadline and is_same(pid, record["token"], record["cmd"]):
+    while time.monotonic() < deadline and still_there():
         if say is not None and time.monotonic() >= next_beat:
             say(f"[strata] the leftover process {pid} is still giving its memory back ...")
             next_beat = time.monotonic() + 10.0
         time.sleep(0.1)
-    if is_same(pid, record["token"], record["cmd"]):
+    if still_there():
         return "stuck"
     drop_record(pid)
     return "ended"
@@ -327,21 +354,56 @@ def end_leftovers(profile: str | None = None, *, grace: float = 8.0, settle: flo
 
 # ---------------------------------------------------------------------------- engines older versions left
 
-def orphans_of(engine_exe: str) -> list[Ident]:
-    """Processes that are exactly this engine executable, running ``--serve``, whose parent no longer exists.
+def orphan_scan_budget() -> float:
+    """The wall-clock ceiling for one full-system orphan scan (seconds).
+
+    The engine-start path runs this scan synchronously (an engine an earlier
+    run lost still holds the GPU), so on a machine where per-handle process
+    queries are slow -- an antivirus inspecting every handle open, a huge
+    process table -- an unbounded scan stalled every engine start by tens of
+    seconds and blew every startup budget (measured 47-57 s for ~500
+    processes while PowerShell enumerated the same table in 0.1 s). The
+    scan is best-effort cleanup: it must never be the reason a start fails,
+    so the default ceiling is small -- a leftover that comes later in the
+    process table is found (and ended) on a later, faster start instead.
+    STRATA_ORPHAN_SCAN_BUDGET_S overrides it; 0 or negative means unbounded
+    (the old behavior, for the operator who insists)."""
+    raw = os.environ.get("STRATA_ORPHAN_SCAN_BUDGET_S")
+    if raw is None:
+        return 5.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 5.0
+    return value if value > 0 else float("inf")
+
+
+def orphans_of(engine_exe: str, *, budget_s: float | None = None) -> tuple[list[Ident], bool]:
+    """(orphans, budget_tripped): processes that are exactly this engine executable, running ``--serve``, whose parent
+    no longer exists.
 
     Earlier Strata versions wrote no record. Such an engine is not a service anybody started on purpose: the
     server that owned it is gone, and it holds the GPU. Only the executable that is about to be started is
-    matched, never another installation's, and a process whose parent is alive is never an orphan."""
+    matched, never another installation's, and a process whose parent is alive is never an orphan.
+
+    Round 4: the scan is time-bounded (`budget_s`, default `orphan_scan_budget()`) -- a best-effort cleanup must
+    not stall the start that needs the GPU. `budget_tripped` says the ceiling fired: what came back is PARTIAL,
+    and the caller should say so (the leftover, if any, is found on a later, faster start)."""
     if psutil is None or not engine_exe:
-        return []
+        return [], False
+    budget = orphan_scan_budget() if budget_s is None else budget_s
+    deadline = time.monotonic() + budget
     mine = {os.getpid()}
     try:
         mine.update(q.pid for q in psutil.Process().parents() if q.pid != 1)    # pid 1 adopts orphans: it is not a starter
     except psutil.Error:
         pass
-    found = []
+    found: list[Ident] = []
+    tripped = False
     for p in psutil.process_iter(["pid", "ppid", "cmdline", "create_time"]):
+        if time.monotonic() >= deadline:
+            tripped = True
+            break
         try:
             cmd = p.info.get("cmdline") or []
             if "--serve" not in cmd or p.pid in mine:
@@ -364,13 +426,21 @@ def orphans_of(engine_exe: str) -> list[Ident]:
                 found.append(ident)
         except (psutil.Error, OSError):
             continue
-    return found
+    return found, tripped
 
 
-def end_orphans(engine_exe: str, *, grace: float = 8.0, settle: float = 120.0, say=None) -> list[dict]:
+def end_orphans(engine_exe: str, *, grace: float = 8.0, settle: float = 120.0, say=None,
+                budget_s: float | None = None) -> list[dict]:
     """End the orphans of `engine_exe` (see `orphans_of`), re-verified one by one."""
     ended = []
-    for ident in orphans_of(engine_exe):
+    found, tripped = orphans_of(engine_exe, budget_s=budget_s)
+    if tripped and say is not None:
+        budget = orphan_scan_budget()
+        say(f"[strata] the orphan scan hit its {budget:.0f} s budget; it found "
+            f"{len(found)} candidate(s) and stopped -- a leftover that came later in the "
+            f"process table is found on a later, faster start "
+            f"(STRATA_ORPHAN_SCAN_BUDGET_S raises the ceiling)")
+    for ident in found:
         record = {"pid": ident.pid, "token": ident.token, "cmd": list(ident.cmd), "role": "engine", "written_at": 0}
         outcome = end_one(record, grace=grace, settle=settle, say=say)
         ended.append({"pid": ident.pid, "outcome": outcome})

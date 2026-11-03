@@ -804,9 +804,12 @@ def wrong_make_notice(built: str, archs: tuple[str, ...], here: str) -> str:
 
 
 def resolve(root: Path | None = None, *, backend: str | None = None, target: str | None = None,
-            full: bool = False, runtime: str | None = None) -> EngineComponent:
+            full: bool = False, runtime: str | None = None,
+            _detected: tuple[str | None, str] | None = None) -> EngineComponent:
     """The engine to start on this machine, or `EngineMissing` / `EngineIntegrityError`. Never downloads, never creates
-    the folder. `full=True` hashes every file (a start does); the default is the quick check the listings use."""
+    the folder. `full=True` hashes every file (a start does); the default is the quick check the listings use.
+    `_detected`: a caller that already ran `detect_backend` (status) passes its (backend, how) here, so the probes are
+    not run twice; it is ignored when `backend` is given."""
     base = root or components_dir()
     target = target or host_platform()
     found, problems = scan(base)
@@ -815,7 +818,13 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
     wanted = backend
     how = "requested"
     if wanted is None:
-        wanted, how = detect_backend()
+        try:
+            wanted, how = detect_backend() if _detected is None else _detected
+        except ComponentProblem as exc:
+            # a bad STRATA_ENGINE_BACKEND (or another detection problem) raised a raw
+            # ValueError through paths whose contract is the typed family (a start
+            # then died with a traceback instead of the clear exit-5 notice)
+            raise EngineMissing(f"the engine backend could not be detected: {exc}", base) from exc
     if wanted is None:
         # no GPU tool answered: only a CPU engine can be started
         wanted = "cpu"
@@ -917,17 +926,22 @@ def status(root: Path | None = None, *, backend: str | None = None, full: bool =
     """What `strata components engine` and the app's host report. Always answers; never raises for a missing engine."""
     base = root or components_dir()
     found, problems = scan(base)
+    detection_failed = False
     try:
         detected, how = detect_backend()
     except ComponentProblem as exc:
-        detected, how = None, str(exc)
+        detected, how, detection_failed = None, str(exc), True
     report = {"schema_version": 1, "components_dir": str(base), "platform": host_platform(),
               "backend": backend or detected, "backend_source": "requested" if backend else how,
               "installed": [item.to_dict() for item in found], "problems": problems,
               "engine": None, "usable": False, "notice": None, "acquires": False,
               "pinned": pinned_folder(base), "previous": previous_folder(base), "update_notice": cached_notice(base)}
     try:
-        chosen = resolve(base, backend=backend, full=full)
+        # the detection result goes in, so nvidia-smi/rocminfo/sycl-ls are not probed
+        # twice per status (a hung tool doubled the wait); a FAILED detection is not
+        # passed: resolve must raise its own typed answer, not read it as "no GPU"
+        chosen = resolve(base, backend=backend, full=full,
+                         _detected=None if detection_failed else (detected, how))
         report["engine"] = chosen.to_dict()
         report["usable"] = True
     except EngineMissing as exc:

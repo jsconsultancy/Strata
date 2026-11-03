@@ -113,6 +113,28 @@ if WINDOWS:
         finally:
             _k32.CloseHandle(handle)
 
+    def process_object_matches(pid: int, created: int) -> bool:
+        """Whether the process OBJECT for (pid, creation ticks) still exists -- including one
+        that has exited but is not done giving its memory back.  TerminateProcess sets the
+        exit code at once (GetExitCodeProcess stops answering STILL_ACTIVE, so
+        process_started says None the moment a kill lands), but the object -- and the
+        teardown that returns tens of GB of pinned memory (#4051) -- lives until the
+        kernel is done with it.  Refused (ERROR_ACCESS_DENIED) counts as present:
+        somebody's handle keeps it."""
+        if type(pid) is not int or pid <= 0 or type(created) is not int:
+            return False
+        handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if not _k32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                        ctypes.byref(k), ctypes.byref(u)):
+                return True                       # an object is there even if its times are not readable
+            return ((c.dwHighDateTime << 32) | c.dwLowDateTime) == created
+        finally:
+            _k32.CloseHandle(handle)
+
     def pid_alive(pid: int, started: int | None = None) -> bool:
         """Whether `pid` is a running process, and, when `started` is given, the one created at that time."""
         if type(pid) is not int or pid <= 0:
@@ -138,6 +160,9 @@ else:
 
     def process_image(pid: int) -> str | None:
         return None
+
+    def process_object_matches(pid: int, created: int) -> bool:
+        raise OSError("Windows only")
 
     def pid_alive(pid: int, started: int | None = None) -> bool:
         raise OSError("Windows only")

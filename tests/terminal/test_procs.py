@@ -60,9 +60,14 @@ class Procs(unittest.TestCase):
         found, unverifiable = procs.leftovers()
         self.assertEqual([r["pid"] for r in found], [child.pid])
         self.assertEqual(unverifiable, [])
+        pid = child.pid
+        # the settle waits for the process OBJECT (the pinned memory going back, #4051): this test's own
+        # open handle would pin that object forever, so give it up before ending the leftover
+        self.started.remove(child)
+        del child
         result = procs.end_leftovers(grace=2)
-        self.assertEqual([r["pid"] for r in result["ended"]], [child.pid])
-        self.assertTrue(self.gone(child))
+        self.assertEqual([r["pid"] for r in result["ended"]], [pid])
+        self.assertIsNone(procs.identify(pid), "the process, and its object, are gone")
         self.assertEqual(procs.records(), [], "the record goes with the process")
 
     def test_a_child_with_a_live_starter_is_never_touched(self):
@@ -100,9 +105,15 @@ class Procs(unittest.TestCase):
         procs.write_record(other.pid, "engine", profile="app-2", parent_pid=other_starter.pid)
         starter.kill(); other_starter.kill()
         starter.wait(timeout=10); other_starter.wait(timeout=10)
+        child_pid, other_pid = child.pid, other.pid
+        # as above: our open handles would pin the process objects the settle waits for
+        self.started.remove(child); del child
+        self.started.remove(other); del other
         result = procs.end_leftovers(profile="app-1", grace=2)
-        self.assertEqual([r["pid"] for r in result["ended"]], [child.pid])
-        self.assertIsNone(other.poll(), "another profile's leftover is not part of this stop")
+        self.assertEqual([r["pid"] for r in result["ended"]], [child_pid])
+        self.assertIsNotNone(procs.identify(other_pid), "another profile's leftover is not part of this stop")
+        tidied = procs.end_leftovers(profile="app-2", grace=1)    # the other one is ended, not left to linger
+        self.assertEqual([r["pid"] for r in tidied["ended"]], [other_pid])
 
     def test_garbage_in_the_records_folder_is_ignored(self):
         base = procs.procs_dir()
@@ -128,11 +139,17 @@ class Procs(unittest.TestCase):
         deadline = time.monotonic() + 10
         while procs.identify(live.pid) is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        found = [i.pid for i in procs.orphans_of(sys.executable)]
+        # an explicit large budget: this test pins orphan MATCHING, not the
+        # round-4 scan ceiling (which can legitimately trip on a machine
+        # whose per-process queries are slow)
+        found = [i.pid for i in procs.orphans_of(sys.executable, budget_s=600)[0]]
         self.assertIn(orphan_pid, found)
         self.assertNotIn(live.pid, found, "this test process started it: a live parent")
-        self.assertEqual(procs.orphans_of(str(Path(sys.executable).with_name("not-the-engine"))), [])
-        ended = procs.end_orphans(sys.executable, grace=2)
+        # round 4: the return is (orphans, budget_tripped); nothing matches
+        # this exe, so the list is empty however the budget lands
+        self.assertEqual(procs.orphans_of(str(Path(sys.executable).with_name("not-the-engine")),
+                                          budget_s=600)[0], [])
+        ended = procs.end_orphans(sys.executable, grace=2, budget_s=600)
         self.assertIn(orphan_pid, [e["pid"] for e in ended])
         self.assertIsNone(live.poll())
         self.assertIsNone(procs.start_token(orphan_pid))

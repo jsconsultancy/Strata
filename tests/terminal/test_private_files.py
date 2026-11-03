@@ -163,6 +163,29 @@ class ElevatedRunLockoutTests(unittest.TestCase):
         path.write_text("{}")
         self.assertEqual(path.read_text(), "{}")
 
+    def test_after_adopting_the_defaults_what_we_start_stays_queryable(self):
+        """The token's default DACL is inherited by what the process STARTS, too -- as their PROCESS
+        descriptor.  An FA (file all access) entry there carries no PROCESS_QUERY_LIMITED_INFORMATION bit:
+        the engine-identity machinery (start_token / leftovers / winproc) then could not open a single
+        process the CLI or the app host had started, every recorded engine looked like a stale pid, and
+        the records of running engines were dropped as stale.  GA maps to full access on any object type."""
+        if not pf.WINDOWS:
+            self.skipTest("the token default DACL is Windows")
+        self.assertTrue(pf.adopt_user_defaults())
+        import ctypes
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            handle = ctypes.WinDLL("kernel32", use_last_error=True) \
+                .OpenProcess(0x1000, False, proc.pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            self.assertTrue(handle, f"OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) was refused "
+                                    f"(error {ctypes.get_last_error()}) after adopt_user_defaults")
+            if handle:
+                ctypes.WinDLL("kernel32").CloseHandle(handle)
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_only_the_users_own_folders_are_ever_repaired(self):
         self.assertFalse(pf.repair_access(os.environ.get("SystemRoot", "C:\Windows") + "\System32\drivers"))
 

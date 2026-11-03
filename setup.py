@@ -5986,8 +5986,10 @@ def data_folder_in_place() -> tuple:
 
 def write_config(path: Path, cfg: dict):
     """A run config, written whole or not at all (#459): to a temporary file first, then moved over the old one, so
-    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind."""
-    tmp = path.with_name(path.name + ".tmp")
+    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind.  The temp is
+    pid-suffixed (as procs.write_record): a server saving Settings shares this file and holds only its own
+    config_lock, and a shared fixed .tmp let the two writers' replace() install each other's half-written content."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     atomic.replace(tmp, path)
 

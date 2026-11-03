@@ -372,8 +372,13 @@ def adopt_user_defaults() -> bool:
             ok_owner = bool(_advapi.SetTokenInformation(token, _TOKEN_OWNER, ctypes.byref(_Owner(psid)),
                                                         ctypes.sizeof(_Owner)))
             descriptor = ctypes.c_void_p()
+            # GA (generic all), not FA: this default DACL is not only for files -- what the process STARTS
+            # inherits it as its PROCESS descriptor, and FA is the file object's specific-rights mask, whose
+            # bits do not include PROCESS_QUERY_LIMITED_INFORMATION: the engine-identity machinery
+            # (start_token / leftovers) then could not open a single process the CLI or the app had started,
+            # and every recorded engine looked like a stale pid with the record gone
             if not _advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    f"D:(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)", _SDDL_REVISION_1, ctypes.byref(descriptor), None):
+                    f"D:(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)", _SDDL_REVISION_1, ctypes.byref(descriptor), None):
                 return False
             present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
             if not _advapi.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(dacl),

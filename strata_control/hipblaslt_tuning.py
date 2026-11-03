@@ -247,7 +247,10 @@ def present_archs(cfg: dict | None = None) -> list[str]:
         archs = ec.hip_archs_present()
     except Exception:
         return []
-    gpu = (cfg or {}).get("gpu")
-    picked = gpu if isinstance(gpu, list) else [gpu] if isinstance(gpu, int) and not isinstance(gpu, bool) else []
+    from strata_control import gpu_roles
+    # the config's own parsing for "gpu" (int, list, or the hand-edited "0,2"/"2"
+    # string form): before, the string form picked [] and the tuning table of the
+    # FIRST card's arch was chosen while the engine ran solely on another card
+    picked = gpu_roles._int_list((cfg or {}).get("gpu"))
     chosen = [archs[i] for i in picked if 0 <= i < len(archs)] if os.name != "nt" else []
     return chosen or archs

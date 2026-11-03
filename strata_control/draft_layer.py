@@ -39,9 +39,17 @@ def strip(args: list[Any]) -> tuple[list[str], list[str]]:
     i = 0
     while i < len(items):
         a = items[i]
+        flag, eq, _ = a.partition("=")
         if a in MTP_FLAGS:
             removed.append(a)
             i += 2 if MTP_FLAGS[a] and i + 1 < len(items) and not items[i + 1].startswith("--") else 1
+            continue
+        if eq and flag in MTP_FLAGS:
+            # the --mtp=<folder> / --spec-min-p=<p> spelling is the same option:
+            # left in, the ~1 GB draft layer loaded despite "mtp": false while the
+            # log said it was left out
+            removed.append(a)
+            i += 1
             continue
         out.append(a)
         i += 1

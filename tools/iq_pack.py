@@ -437,8 +437,14 @@ def expert_layout(model: Model, src: pathlib.Path):
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+    routers = ["blk.%d.ffn_gate_inp.weight" % l for l in range(n_layers)]
+    missing = [n for n in routers if n not in T]
+    if missing:
+        # the error-string contract every neighboring bad shape here returns;
+        # a pruned/edited pack keeping experts without routers used to KeyError
+        return "missing router tensor(s): " + ", ".join(missing)
     n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+    if any(int(T[n].shape[1]) != n_expert for n in routers):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
     for l in range(n_layers):

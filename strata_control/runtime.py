@@ -220,6 +220,17 @@ def _read_state(name: str) -> dict | None:
         return None
     if not stat.S_ISREG(details.st_mode) or not _is_private(details, path) or details.st_size > 16 * 1024:
         raise ProfileError("runtime state file is not private or is invalid", 5)
+    if details.st_size == 0:
+        # round 3: a crash between _write_new's os.open(O_CREAT|O_EXCL) and
+        # its write leaves a 0-byte file (a crash mid-write leaves a
+        # truncated prefix -- unparseable, handled below). The 0-byte case
+        # used to raise "unreadable": status/stop/restart/verify/start all
+        # refused with exit 5 forever, and the recovery machinery itself
+        # could never run (_recover_stale's first statement is
+        # _read_state). A 0-byte file is "not yet written": the same
+        # not-there answer a missing file gives, so stale recovery (or a
+        # fresh start) reclaims it.
+        return None
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
@@ -280,6 +291,38 @@ def _host_lease_active(name: str) -> bool:
         return False
     finally:
         os.close(descriptor)
+
+
+def _reclaim_unwritten(name: str) -> bool:
+    """Remove a 0-byte runtime state file when nothing holds its lease.
+
+    round 3: _write_new creates the file (O_CREAT|O_EXCL) BEFORE writing
+    it, so a crash in that window leaves a 0-byte artifact that blocked
+    every later start (_write_new refuses an existing path) and every
+    management command (_read_state raised "unreadable"). The state lease
+    lives on the file itself: taking its exclusive lock proves no host is
+    between open and write, so the artifact is safe to unlink."""
+    path, _, _ = _paths(_name(name))
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(details.st_mode) or details.st_size != 0:
+        return False
+    try:
+        descriptor = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if not _lock_file(descriptor, exclusive=True):
+            return False                    # a live host is mid-start
+    finally:
+        os.close(descriptor)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
 
 
 def _recover_stale(name: str, *, wait: float) -> bool:
@@ -515,6 +558,10 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
         procs.end_leftovers(profile=name)               # a server or engine a lost owner left behind (verified one by one)
         if _read_state(name) is not None:
             _recover_stale(name, wait=wait)
+        # round 3: a crashed start left a 0-byte state file (created before
+        # it was written): reclaim it, or the host's O_EXCL write below
+        # would refuse an existing path and every start would fail
+        _reclaim_unwritten(name)
         descriptor = os.open(log_path, flags, 0o600)
         with os.fdopen(descriptor, "ab") as stream:
             command = [sys.executable, "-m", "strata_control.runtime", "--host", name,
@@ -533,7 +580,16 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
                                     stderr=subprocess.STDOUT, close_fds=True, **detach)
         _STARTED_HOSTS[name] = proc
         deadline = time.monotonic() + max(5.0, wait)
-        while _read_state(name) is None and proc.poll() is None and time.monotonic() < deadline:
+
+        def _state_polling():
+            # the host is between os.open and fsync here: a sampled read can
+            # see the 0-byte file (None since round 3) or a truncated prefix
+            # (ProfileError) -- both mean "not yet written", not "failed"
+            try:
+                return _read_state(name)
+            except ProfileError:
+                return None
+        while _state_polling() is None and proc.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if _read_state(name) is None:
             if proc.poll() is not None:

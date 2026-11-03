@@ -122,12 +122,21 @@ class GGUFFile:
 
     def _value(self, fh):
         (t,) = struct.unpack("<I", fh.read(4))
+        if t not in GGUF_META:
+            # a garbled/unknown metadata type byte raises ValueError (the file's
+            # documented contract; setup.check_shards catches it for its clean
+            # "not a whole GGUF shard" line) -- a bare KeyError escaped that
+            raise ValueError(f"{self.path.name}: unknown metadata value type {t} "
+                             f"at byte {fh.tell()}")
         name, size = GGUF_META[t]
         if name == "string":
             return self._str(fh)
         if name == "array":
             (et,) = struct.unpack("<I", fh.read(4))
             (count,) = struct.unpack("<Q", fh.read(8))
+            if et not in GGUF_META:
+                raise ValueError(f"{self.path.name}: unknown array element type {et} "
+                                 f"at byte {fh.tell()}")
             ename, esize = GGUF_META[et]
             if ename == "string":
                 return [self._str(fh) for _ in range(count)]

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -56,12 +57,30 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 1800) -> None
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
                 if r.status == 200:
-                    post(port, "Say hi.", 8)
-                    return
-        except Exception:
-            pass
+                    break                       # listed: the server is up; the warm-up decides readiness
+        except OSError:                         # not listening yet (URLError/HTTPError while booting)
+            time.sleep(3)
+            continue
         time.sleep(3)
-    raise TimeoutError("server not ready")
+    else:
+        raise TimeoutError("server not ready")
+    # the warm-up runs OUTSIDE the connection-phase swallow: the old bare
+    # `except Exception: pass` around it turned a deterministic arm failure
+    # (a build that 400s this request shape, or 500s on generation) into a
+    # silent poll of the full 1800 s timeout, per arm, per round
+    last: Exception | None = None
+    for _ in range(3):
+        try:
+            post(port, "Say hi.", 8)
+            return
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"the server refused its warm-up request (HTTP {e.code}): this arm "
+                               "cannot serve this client's request shape") from e
+        except OSError as e:                    # dropped between /v1/models and now: retry
+            last = e
+            time.sleep(3)
+    raise RuntimeError(f"the server answers /v1/models but the warm-up request never got "
+                       f"through: {last}")
 
 
 def main() -> int:
@@ -74,7 +93,8 @@ def main() -> int:
     ap.add_argument("--long-words", type=int, default=6000)
     ap.add_argument("--log", default="ab_engine.jsonl")
     a = ap.parse_args()
-    base = json.loads(Path(a.config).read_text())
+    base = json.loads(Path(a.config).read_text(encoding="utf-8-sig"))   # a BOM or a UTF-8 path (a Cyrillic model
+    # folder) read as the console's cp1252 mojibakes the paths into the per-arm config below
     arms = []
     for s in a.arms:
         name, _, kv = s.partition(":")
@@ -82,57 +102,70 @@ def main() -> int:
         arms.append((name, env))
     reqs = [(f"chat{i}", p) for i, p in enumerate(PROMPTS)] + [("long", long_prompt(a.long_words))]
     out = open(a.log, "a")
-    res: dict = {n: {} for n, _ in arms}
-    for rnd in range(a.rounds):
-        order = arms if rnd % 2 == 0 else arms[::-1]
-        for name, env in order:
-            cfg = dict(base)
-            e = dict(env)
-            if "exe" in e:
-                cfg["exe"] = e.pop("exe")
-            if "xargs" in e:                       # extra engine arguments, ';'-separated
-                cfg["args"] = list(base["args"]) + e.pop("xargs").split(";")
-            cfg["port"] = a.port
-            cfg["log"] = str(Path(tempfile.gettempdir()) / f"ab_{name}_r{rnd}.log")
-            cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
-            cpath.write_text(json.dumps(cfg, indent=1))
-            penv = dict(os.environ, **e)
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
-                                     str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=penv,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                t0 = time.time()
-                wait_ready(a.port, proc)
-                print(f"round {rnd} {name}: ready in {time.time() - t0:.0f} s", flush=True)
-                for tag, p in reqs:
-                    r = post(a.port, p, a.max_new)
-                    t = r.get("timings", {})
-                    row = {"round": rnd, "arm": name, "req": tag, "decode": t.get("predicted_per_second"),
-                           "prompt": t.get("prompt_per_second"), "prompt_n": t.get("prompt_n"),
-                           "n": r.get("usage", {}).get("completion_tokens"),
-                           "text": r["choices"][0]["message"].get("content", "")[:80]}
-                    out.write(json.dumps(row) + "\n")
-                    out.flush()
-                    res[name].setdefault(tag, []).append(row)
-                    print(f"  {tag:6s} decode {row['decode']} tok/s  prompt {row['prompt']} tok/s ({row['prompt_n']})  "
-                          f"n {row['n']}", flush=True)
-            finally:
-                proc.terminate()
+    try:
+        res: dict = {n: {} for n, _ in arms}
+        for rnd in range(a.rounds):
+            order = arms if rnd % 2 == 0 else arms[::-1]
+            for name, env in order:
+                cfg = dict(base)
+                e = dict(env)
+                if "exe" in e:
+                    cfg["exe"] = e.pop("exe")
+                if "xargs" in e:                       # extra engine arguments, ';'-separated
+                    cfg["args"] = list(base["args"]) + e.pop("xargs").split(";")
+                cfg["port"] = a.port
+                cfg["log"] = str(Path(tempfile.gettempdir()) / f"ab_{name}_r{rnd}.log")
+                cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
+                cpath.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                penv = dict(os.environ, **e)
+                proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
+                                         str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=penv,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 try:
-                    proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                time.sleep(5)
-    print("\nmedians over rounds:")
-    for tag, _ in reqs:
-        cells = []
-        for name, _ in arms:
-            rows = res[name].get(tag, [])
-            d = statistics.median([x["decode"] for x in rows if x["decode"]]) if rows else float("nan")
-            pr = statistics.median([x["prompt"] for x in rows if x["prompt"]]) if rows else float("nan")
-            cells.append(f"{name}: decode {d:6.1f}  prompt {pr:7.1f}")
-        print(f"  {tag:6s} | " + " | ".join(cells))
-    return 0
+                    t0 = time.time()
+                    wait_ready(a.port, proc)
+                    print(f"round {rnd} {name}: ready in {time.time() - t0:.0f} s", flush=True)
+                    for tag, p in reqs:
+                        # one failed request must not kill a multi-hour run before any
+                        # median prints: the cell stays visibly incomplete in the jsonl
+                        try:
+                            r = post(a.port, p, a.max_new)
+                            t = r.get("timings", {})
+                            row = {"round": rnd, "arm": name, "req": tag, "decode": t.get("predicted_per_second"),
+                                   "prompt": t.get("prompt_per_second"), "prompt_n": t.get("prompt_n"),
+                                   "n": r.get("usage", {}).get("completion_tokens"),
+                                   "text": r["choices"][0]["message"].get("content", "")[:80]}
+                        except Exception as e:     # noqa: BLE001
+                            row = {"round": rnd, "arm": name, "req": tag,
+                                   "error": f"{type(e).__name__}: {e}"}
+                            out.write(json.dumps(row) + "\n")
+                            out.flush()
+                            print(f"  {tag:6s} FAILED {row['error']}", flush=True)
+                            continue
+                        out.write(json.dumps(row) + "\n")
+                        out.flush()
+                        res[name].setdefault(tag, []).append(row)
+                        print(f"  {tag:6s} decode {row['decode']} tok/s  prompt {row['prompt']} tok/s ({row['prompt_n']})  "
+                              f"n {row['n']}", flush=True)
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(60)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    time.sleep(5)
+        print("\nmedians over rounds:")
+        for tag, _ in reqs:
+            cells = []
+            for name, _ in arms:
+                rows = res[name].get(tag, [])
+                d = statistics.median([x["decode"] for x in rows if x.get("decode")]) if rows else float("nan")
+                pr = statistics.median([x["prompt"] for x in rows if x.get("prompt")]) if rows else float("nan")
+                cells.append(f"{name}: decode {d:6.1f}  prompt {pr:7.1f}")
+            print(f"  {tag:6s} | " + " | ".join(cells))
+        return 0
+    finally:
+        out.close()
 
 
 if __name__ == "__main__":

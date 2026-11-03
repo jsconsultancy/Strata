@@ -64,6 +64,11 @@ def from_gguf(src, out):
     t = next((t for t in g.tensors if t.name == "token_embd.weight"), None)
     if t is None or len(t.shape) != 2 or t.expected_bytes() is None:
         sys.exit("%s: no 2-D token_embd.weight of a known type" % src)
+    try:
+        qt = Q[t.type_name]                      # the reader knows more types than this gguf-py
+    except KeyError:                             # (MXFP8, the APR trellis types): clean refusal,
+        sys.exit("%s: token_embd.weight is %s, which the available gguf-py cannot dequantize"
+                 % (src, t.type_name))           # not a KeyError past the guard above
     dim, vocab = int(t.shape[0]), int(t.shape[1])
     row = t.expected_bytes() // vocab
     mm = np.memmap(src, dtype=np.uint8, mode="r")
@@ -78,7 +83,7 @@ def from_gguf(src, out):
         for r0 in range(0, vocab, rows):
             r1 = min(vocab, r0 + rows)
             raw = np.asarray(mm[base + r0 * row: base + r1 * row]).reshape(r1 - r0, row)
-            vals = quants.dequantize(raw, Q[t.type_name]).astype(np.float32)
+            vals = quants.dequantize(raw, qt).astype(np.float32)
             if not np.isfinite(vals).all():
                 sys.exit("token_embd.weight has non-finite values")
             w.write(quants.quantize(vals, Q.BF16).tobytes())

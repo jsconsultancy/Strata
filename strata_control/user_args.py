@@ -62,7 +62,13 @@ def flat(gs: list[list[str]]) -> list[str]:
 
 
 def flag_of(group: list[str]) -> str:
-    return group[0] if group and group[0].startswith("--") else ""
+    if not group or not group[0].startswith("--"):
+        return ""
+    # the --flag=value spelling is the same option (--mtp=C:\mtp-rt heads a group
+    # whose flag is --mtp): normalizing here makes merge/capture/set_flag treat
+    # both spellings alike -- before, a hand-written --mtp=... survived next to
+    # the generated --mtp and the engine took whichever duplicate its parser kept
+    return group[0].split("=", 1)[0]
 
 
 def merge(args: Any, user: Any) -> list[str]:
