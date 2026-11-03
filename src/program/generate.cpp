@@ -11606,6 +11606,8 @@ int main(int argc, char** argv) {
             std::thread th;                                       // joined by the loop thread (finish or QUIT)
             uint64_t ticket = 0;   // the ledger's promise for the loader's staging (largest layer + margin),
                                    // opened at RSTART, closed wherever the thread is joined
+            Clock::time_point started{};              // set at RSTART: the finish line reports the load's span
+            long long waited_ms = 0;                  // admission time spent at the gate (the mutex guards it)
         };
         struct BSlot {
             bool active = false, stop = false;
@@ -11782,6 +11784,7 @@ int main(int argc, char** argv) {
                 ready = true;
             }
             const long long waited_ms = (long long) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            load.waited_ms += waited_ms;   // the finish line's total (the mutex is held here)
             if (ready && load.landed >= need) {
                 // Gate E instrumentation: a wait worth saying (the loader normally reads ahead far enough
                 // that the admission never blocks; when it does, the line says where the tail time went)
@@ -11837,7 +11840,10 @@ int main(int argc, char** argv) {
                 sl.p = (int64_t) sl.ids.size();
                 sl.cached = !sl.ids.empty() && !sl.img && o.prompt_cache > 0;
                 std::fprintf(stderr, "strata serve: session prefetch finished for slot %d: %zu tokens, %zu "
-                                     "checkpoints%s\n", b, sl.ids.size(), sl.checks.size(), from.c_str());
+                                     "checkpoints%s in %.1f s (the admission waited %.1f s at the gate)\n", b,
+                             sl.ids.size(), sl.checks.size(), from.c_str(),
+                             std::chrono::duration<double>(Clock::now() - load->started).count(),
+                             (double) load->waited_ms / 1000.0);
                 return true;
             }
             if (load->leased) bslot_ss[0][(size_t) b] = std::move(load->leased);
@@ -12832,6 +12838,7 @@ int main(int argc, char** argv) {
                             layer_max = std::max(layer_max, lb);
                         }
                         load->ticket = strata::core::host_ledger_ticket_open(layer_max + (64u << 20));
+                        load->started = Clock::now();
                         std::fprintf(stderr, "strata serve: session prefetch started for slot %d: %zu K/V layers, "
                                      "%zu tokens, %llu bytes from %s\n", slot, index.size(),
                                      load->meta.live.ids.size(), (unsigned long long) reader->file_bytes(),
