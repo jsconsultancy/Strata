@@ -72,7 +72,14 @@ def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str
     if "error" in msg:
         err = msg["error"] if isinstance(msg["error"], dict) else {"message": str(msg["error"])}
         raise McpError(f"{err.get('message') or 'error'} (code {err.get('code')})")
-    return msg.get("result") or {}
+    result = msg.get("result")
+    if result is not None and not isinstance(result, dict):
+        # a JSON-RPC result that is not an object ("done", a bare number) is a
+        # broken server: McpError, so a start deterministically lands on
+        # "failed" and a call on the promised "error: ..." tool result --
+        # AttributeError used to kill the start thread / the tool worker
+        raise McpError(f"the server replied a non-object result ({type(result).__name__})")
+    return result or {}
 
 
 # ------------------------------------------------------------------------------------------------ transports
@@ -433,6 +440,14 @@ class McpServer:
             print(f"[strata] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat works "
                   "without them.", flush=True)
             return False
+        except Exception as e:                        # noqa: BLE001 - a start failure of ANY kind lands here, not on
+            # the start thread (a non-OSError from popen, an OSError subclass the transport missed): the module
+            # contract is "a server that does not start is left out with one log line", never a stuck "starting"
+            self.status, self.error, self.tools = "failed", f"{type(e).__name__}: {e}", []
+            t.close()
+            print(f"[strata] MCP server {self.name!r} did not start: {type(e).__name__}: {e}. Its tools are left "
+                  "out; the chat works without them.", flush=True)
+            return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
         with self.lock:
@@ -453,11 +468,21 @@ class McpServer:
             raise
 
     def close(self):
-        with self.lock:
+        # a call-triggered restart holds the lock for up to start_timeout_s
+        # (initialize + up to 100 tools/list pages); a shutdown must not wait it
+        # out.  A server wedged mid-restart is ended by _start's own failure
+        # path, and at interpreter exit end_children ends its process -- skip it.
+        if not self.lock.acquire(timeout=5):
+            print(f"[strata] MCP server {self.name!r} is mid-restart; its process is ended by "
+                  "the stop path", flush=True)
+            return
+        try:
             if self.transport is not None:
                 self.transport.close()
             if self.status in ("ready", "starting"):
                 self.status = "stopped"
+        finally:
+            self.lock.release()
 
 
 # ------------------------------------------------------------------------------------------------ the hub
@@ -613,6 +638,11 @@ def _check_server(name, cfg, where) -> dict:
         raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"args\" must be a list")
     if not isinstance(cfg.get("env") or {}, dict):
         raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"env\" must be an object")
+    if cfg.get("cwd") is not None and (not isinstance(cfg.get("cwd"), str) or not cfg["cwd"].strip()):
+        # the one field start did not check: a non-string reached lifeline.popen as
+        # cwd, whose os.fspath raised TypeError - past the OSError catch - and the
+        # start thread died with the status stuck on "starting" forever
+        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"cwd\" must be a non-empty string")
     return cfg
 
 

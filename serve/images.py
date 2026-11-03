@@ -206,7 +206,16 @@ class ImageGen:
 
     def _prune(self) -> None:
         """Keep the newest keep_files PNGs of response_format url (the oldest go)."""
-        files = sorted((p for p in self.dir.glob("*.png") if FILE_NAME.match(p.name)), key=lambda p: p.stat().st_mtime)
+        # store() and _prune() run outside both the GPU FIFO and self.lock (response()
+        # is called after gpu_turn), so another response's prune can unlink a file this
+        # sort key is about to stat: FileNotFoundError used to escape response() and drop
+        # the client's connection AFTER a successful generation
+        def mtime(p: Path):
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+        files = sorted((p for p in self.dir.glob("*.png") if FILE_NAME.match(p.name)), key=mtime)
         for p in files[:max(0, len(files) - self.keep_files)]:
             with contextlib.suppress(OSError):
                 p.unlink()
@@ -227,8 +236,10 @@ class ImageGen:
         timeout = float(self.cfg.get("timeout_s") or 3600)
         logf = work / "sd-cli.log"
         t0 = time.monotonic()
-        self.progress = (0, job["steps"])
         with self.lock:
+            # inside the lock: a queued job's (0, steps) set before its FIFO wait used to
+            # overwrite the running job's live progress (and be stale once it started)
+            self.progress = (0, job["steps"])
             with open(logf, "w", encoding="utf-8", errors="replace") as lf:
                 try:
                     from serve import lifeline
@@ -236,6 +247,14 @@ class ImageGen:
                                           stdin=subprocess.DEVNULL, env=image_env(self.cfg),
                                           cwd=str(work), text=True, errors="replace", bufsize=1)
                 except OSError as e:
+                    # the cleanup finally below is not entered yet: the fresh job dir (and
+                    # the progress line) would leak on every start failure for good
+                    self.progress = None
+                    for p in work.iterdir():
+                        with contextlib.suppress(OSError):
+                            p.unlink()
+                    with contextlib.suppress(OSError):
+                        work.rmdir()
                     raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
                 why = None
 
@@ -258,9 +277,13 @@ class ImageGen:
                     time.sleep(0.2)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=30)
+                if proc.poll() is None:
+                    # a HIP/Vulkan ioctl can outlive SIGKILL (the NUC case): say so instead
+                    # of silently sharing the GPU with a process nothing owns any more
+                    self._say(f"sd-cli (pid {proc.pid}) could not be ended; it is still holding the GPU")
                 reader.join(timeout=10)
+                self.progress = None                  # still in the lock: not after a queued job set its own
         secs = time.monotonic() - t0
-        self.progress = None
         log = logf.read_text(encoding="utf-8", errors="replace")
         outs = [work / f"img_{i}.png" for i in range(job["n"])]
         try:
@@ -427,9 +450,20 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
                 gen._say(f"image job: the conversation could not be saved ({e}); unloading the model")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
-        eng.unload()
+        try:
+            eng.unload()
+        except Exception as e:                       # noqa: BLE001 - the job still runs, with what is free
+            # EngineStuck is a real state for a big MoE model slowly unpinning VRAM; bare, it
+            # escaped before gpu_turn's busy=False finally was entered: /v1/status stayed
+            # "busy" until some unrelated request finished, and the saved conversation sat
+            # unrestored -- the same treatment the shrink branch already has
+            gen._say(f"image job: the model could not be unloaded ({e}); the job runs next to it")
+            return saved or None
         if svc.vision is not None and hasattr(svc.vision, "unload"):
-            svc.vision.unload()
+            try:
+                svc.vision.unload()
+            except Exception as e:                   # noqa: BLE001 - the picture encoder is small; the job runs
+                gen._say(f"image job: the picture encoder could not be unloaded ({e})")
         return saved or "unloaded"
     return None
 

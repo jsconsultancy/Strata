@@ -1623,10 +1623,13 @@ class StrataEngine:
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
         and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
-        wait takes over."""
+        wait takes over.  Round 3: returns (BDONE, bt_tokens) -- the BT lines read on the way are tokens the ENGINE's slot
+        generated after the EOS (BSTOP takes a moment); dropping them made slot_held under-report what the slot holds, and
+        pick_slot then matched a shorter prefix than the engine re-checks (lost cache reuse, #1994-style refusals)."""
         if slot >= len(self.slot_q):
             return None
         end = time.monotonic() + wait_s
+        bt: list[int] = []
         while time.monotonic() < end:
             try:
                 line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
@@ -1634,8 +1637,14 @@ class StrataEngine:
                 return None
             if line is None:
                 return None
+            if line.startswith("BT "):
+                try:
+                    bt.append(int(line.split()[2]))
+                except (IndexError, ValueError):
+                    pass
+                continue
             if line.startswith("BDONE "):
-                return line
+                return line, bt
         return None
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
@@ -2139,10 +2148,12 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
+            bt_extra: list[int] = []
             if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
-                    self._apply_bdone(bd.split())
+                    bdone_line, bt_extra = bd
+                    self._apply_bdone(bdone_line.split())
                     bdone_in = True
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
@@ -2153,17 +2164,33 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None:
+            if reserved is not None and reserved < len(self.slot_busy):
+                # round 3: the finally must stay exception-neutral — a restart
+                # that landed first replaced the slot arrays with lists sized
+                # for the NEW engine's batch, and a stale reserved/slot index
+                # out of range used to raise IndexError FROM the finally,
+                # masking the engine death the request was raising and making
+                # the POST wrapper answer 400 "malformed request" instead of
+                # 503 (the same guard its helpers already carry)
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if (slot is not None and slot < len(self.slot_q)
+                    and slot < len(self.slot_live)):
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    if gen0 is not None and len(out) > gen0:
+                        # out[gen0:-1]: drop the trailing EOS; bt_extra: the
+                        # tokens the slot generated after it before BDONE
+                        # (round 3: they used to be consumed and dropped, so
+                        # slot_held under-reported and pick_slot matched a
+                        # prefix the engine's own re-check refuses)
+                        stream = list(prompt) + out[gen0:-1] + bt_extra
+                    else:
+                        stream = None
+                    self.slot_held[slot] = stream if stream is not None else []
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)

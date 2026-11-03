@@ -149,13 +149,26 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
         elif isinstance(kind, tuple) and kind[0] == "arg":
             a = list(new.get("args") or [])
             flag = kind[1]
-            if flag in a[:-1]:
-                i = a.index(flag)
-                if v is None:
-                    del a[i:i + 2]
-                else:
-                    a[i + 1] = str(v)
-            elif v is not None:
+            # round 3: LAST-wins, like the engine's argparse (and
+            # user_args.flag_of). Editing only the FIRST occurrence let a
+            # hand-duplicated flag report `changed` and save the file while
+            # the engine kept the stale LAST value -- a silent no-op setting.
+            # Every occurrence -- and its value -- goes; the new value is
+            # re-appended once. Iterate ALL of a: a[:-1] would silently
+            # drop the trailing element of a flag-free list (the first cut
+            # ate a trailing "--spec-min-p 0.5" value).
+            kept: list[str] = []
+            take_value = False
+            for item in a:
+                if take_value:
+                    take_value = False
+                    continue
+                if item == flag:
+                    take_value = True
+                    continue
+                kept.append(item)
+            a = kept
+            if v is not None:
                 a += [flag, str(v)]
             new["args"] = a
             mine = user_args.set_flag(user_args.capture(new), flag, v)   # a value set here is the person's: it survives setup and the app
@@ -178,7 +191,11 @@ def save(path: str | Path, cfg: dict) -> Path:
     path = Path(path)
     bak = path.with_name(path.name + ".bak")
     shutil.copyfile(path, bak)
-    tmp = path.with_name(path.name + ".tmp")
+    # a pid-suffixed temp (as procs.write_record does): two processes sharing
+    # one config file (a saved server + a manual serve of the same model) each
+    # hold only their own config_lock, and a shared fixed .tmp let a
+    # concurrent writer's truncated content replace() into the live config
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     _atomic_mod.replace(tmp, path)
     return bak

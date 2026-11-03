@@ -304,8 +304,38 @@ class ReplicaEngine:
                  "batch": int(getattr(e, "batch", 0) or 0)} for k, e in enumerate(self.engines)]
 
     # ---- life cycle
+    def _claim(self, k: int, *, cooldown: bool) -> bool:
+        """Atomically take responsibility for (re)starting replica k: True once, and
+        healing[k] stays set until the caller releases it.  The check-and-set used to
+        be split (heal(): healing.get(k) read outside any lock, set after) -- two
+        request threads bursting through route() after a replica died could both pass
+        it -- and ensure_loaded's restart() never consulted the flag at all, so two
+        concurrent StrataEngine.restart calls on one object raced its proc=None swap:
+        one engine ended up owned by nobody, resident in VRAM until the server exited.
+        `cooldown`: heal()'s backoff applies, and a DELIBERATELY unloaded replica is
+        left alone (only a heal skips it; ensure_loaded's restart must reload it)."""
+        with self.lock:
+            e = self.engines[k]
+            if e.alive() or getattr(e, "starting", False) or self.healing.get(k):
+                return False
+            if cooldown:
+                if getattr(e, "unloaded", False):
+                    return False
+                now = time.monotonic()
+                if now < self.heal_at[k]:
+                    return False
+                self.heal_at[k] = now + HEAL_COOLDOWN_S
+            self.healing[k] = True
+            return True
+
+    def _release(self, k: int) -> None:
+        self.healing[k] = False
+
     def restart(self, tries: int = 3):
         dead = [k for k, e in enumerate(self.engines) if not e.alive()]
+        # claim BEFORE spawning the threads: this restart and heal()'s background
+        # one must never run the same StrataEngine.restart concurrently
+        claimed = [k for k in dead if self._claim(k, cooldown=False)]
         errors: dict[int, BaseException] = {}
 
         def one(k):
@@ -314,7 +344,9 @@ class ReplicaEngine:
                 self.router.forget(k)
             except BaseException as e:           # noqa: BLE001
                 errors[k] = e
-        ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in dead]
+            finally:
+                self._release(k)
+        ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in claimed]
         for t in ts:
             t.start()
         for t in ts:
@@ -359,14 +391,9 @@ class ReplicaEngine:
 
     def heal(self) -> None:
         """Start a replica that died again, in the background (the others keep serving)."""
-        now = time.monotonic()
         for k, e in enumerate(self.engines):
-            if e.alive() or getattr(e, "unloaded", False) or getattr(e, "starting", False) or self.healing.get(k):
+            if not self._claim(k, cooldown=True):
                 continue
-            if now < self.heal_at[k]:
-                continue
-            self.heal_at[k] = now + HEAL_COOLDOWN_S
-            self.healing[k] = True
 
             def run(k=k):
                 try:
@@ -377,7 +404,7 @@ class ReplicaEngine:
                 except BaseException as x:       # noqa: BLE001
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
                 finally:
-                    self.healing[k] = False
+                    self._release(k)
             threading.Thread(target=run, daemon=True).start()
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):

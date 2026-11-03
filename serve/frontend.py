@@ -345,7 +345,15 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
         mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, mine)
+                # an assistant message keeps its own tags in its TEXT (#2026:
+                # a client replaying the model's raw call text sends the
+                # tokens the model wrote) -- but tool_calls are the
+                # template's to render from client data, so a literal
+                # </tool_call> inside an argument value (a file an agent
+                # wrote, a quoted heredoc) is marked like everywhere else;
+                # unmarked it encoded as the real end-of-call token
+                # mid-value and the replayed call arrived truncated
+                m[k] = _mark_deep(v, tags if k == "tool_calls" else mine)
         if m.get("role") == "user":
             kept = _keep_tool_result_wrap(content, tags)
             if kept is not None:
@@ -512,7 +520,9 @@ def tool_arguments(raw) -> dict:
     if isinstance(raw, str):
         try:
             value = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: a pathologically deep replay ("["*60000) must
+            # reach the lenient {"arguments": raw} fallback, not escape it
             return {"arguments": raw}
         return value if isinstance(value, dict) else {"arguments": raw}
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
@@ -841,7 +851,7 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
         body = body[:-3] if body.endswith("```") else body
     try:
         obj = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(obj, dict) or not isinstance(obj.get("name"), str) or obj["name"] not in schemas:
         return None
@@ -849,7 +859,7 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     if isinstance(args, str):
         try:
             args = json.loads(args)
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
     if args is None:
         args = {}
@@ -982,7 +992,9 @@ def coerce_value(value: str, declared, notes: list | None = None):
         return value
     try:
         v = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: a pathologically deep value must reach the same
+        # graceful paths as malformed JSON, not escape them
         if not value.lstrip().startswith(("[", "{", "`")) or (isinstance(declared, list) and "string" in declared):
             return value
         try:
@@ -995,8 +1007,10 @@ def coerce_value(value: str, declared, notes: list | None = None):
     if isinstance(v, str) and declared in ("array", "object") and v.lstrip().startswith(("[", "{")):
         try:
             return json.loads(v)
-        except ValueError:
-            return coerce_value(v, declared, notes)
+        except (ValueError, RecursionError):
+            # deep-but-decoded-once: keep that string rather than re-enter
+            # coerce_value (its own loads would raise the same again)
+            return v
     return v
 
 

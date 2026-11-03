@@ -83,7 +83,13 @@ def _the_anchor() -> _Anchor:
 def _die_with_parent(parent: int, then=None):
     """The preexec function of a child: SIGKILL when the starting thread ends; and if it ended already, now."""
     def run() -> None:
-        _libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+        # a failed prctl leaves the child with no pdeathsig (no net): say so on
+        # stderr (the parent's log) rather than silently downgrading.  os.write,
+        # not print, and no imports here: between fork and exec the child must
+        # stay allocation-free (an import could take a lock it already holds).
+        if _libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
+            os.write(2, f"[strata] prctl(PDEATHSIG) failed (errno {ctypes.get_errno()}): "
+                        f"pid {os.getpid()} is not tied to its parent's lifetime\n".encode())
         if os.getppid() != parent:                 # the parent died between fork and prctl
             os.kill(os.getpid(), signal.SIGKILL)
         if then is not None:
@@ -147,7 +153,11 @@ def _watch(child: subprocess.Popen) -> None:
         watcher = subprocess.Popen([sys.executable, "-S", "-c", _WATCHER, str(child.pid), _start_token(child.pid)],
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    close_fds=True, start_new_session=True)
-    except OSError:
+    except OSError as e:
+        # the child now has no watcher: say so instead of silently degrading
+        # (EMFILE/EAGAIN under replica + MCP load are the real cases)
+        print(f"[strata] could not start the lifeline watcher for pid {child.pid} ({e}); "
+              "the child is guarded by the procs record only", flush=True)
         return
     with _watchers_lock:
         _watchers[child.pid] = watcher
@@ -232,6 +242,32 @@ def _own_group(then=None):
     return run
 
 
+def _register(child: subprocess.Popen, role: str, how: str) -> None:
+    """Every safety net a started child gets: its containment (the Windows job
+    object or the macOS watcher), the end_children set, and the procs record +
+    reaper.  Runs even when the start was interrupted AFTER the child existed --
+    a created-but-unregistered child is exactly the orphan this module exists to
+    prevent.  Each net is best effort: one failing must not take the others."""
+    if how == "job":
+        try:
+            if not winjob.contain(child):
+                print(f"[strata] pid {getattr(child, 'pid', '?')} could not join the kill-on-close job object; "
+                      "it is guarded by the procs record only", flush=True)
+        except OSError as e:
+            print(f"[strata] the job object refused pid {getattr(child, 'pid', '?')} ({e}); it is guarded by "
+                  "the procs record only", flush=True)
+    elif how == "watcher":
+        _watch(child)                              # logs its own failure
+    if isinstance(child, _REAL_POPEN):
+        with _children_lock:
+            _children.add(child)
+    try:
+        token = procs.write_record(child.pid, role, profile=os.environ.get("STRATA_RUNTIME_PROFILE") or None)
+        threading.Thread(target=_after_exit, args=(child, token), name="strata-lifeline-reaper", daemon=True).start()
+    except Exception:  # noqa: BLE001 - a record is a safety net, never a reason to fail a start
+        pass
+
+
 def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
     """``subprocess.Popen(args, **kw)`` for a process that must not outlive us.
 
@@ -251,21 +287,28 @@ def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
     if how == "pdeathsig":
         parent, then = os.getpid(), kw.pop("preexec_fn", None)
         kw["preexec_fn"] = _die_with_parent(parent, then)
-        child = _the_anchor().call(lambda: subprocess.Popen(args, **kw))
+        anchor = _the_anchor()
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        anchor._jobs.put((lambda: subprocess.Popen(args, **kw), future))
+        try:
+            child = future.result()
+        except BaseException:
+            # the caller was interrupted (Ctrl+C between bytecodes) while the
+            # anchor thread was mid-Popen: a child it completed has no net at
+            # all -- the anchor's result is discarded by the interrupted wait.
+            # Give it a moment to finish, register whatever it made, then raise.
+            try:
+                made = future.result(timeout=5)
+            except BaseException:
+                raise
+            _register(made, role, how)
+            raise
+        _register(child, role, how)
     else:
         child = subprocess.Popen(args, **kw)
-        if how == "job":
-            winjob.contain(child)
-        else:
-            _watch(child)
-    if isinstance(child, _REAL_POPEN):
-        with _children_lock:
-            _children.add(child)
-    try:
-        token = procs.write_record(child.pid, role, profile=os.environ.get("STRATA_RUNTIME_PROFILE") or None)
-        threading.Thread(target=_after_exit, args=(child, token), name="strata-lifeline-reaper", daemon=True).start()
-    except Exception:  # noqa: BLE001 - a record is a safety net, never a reason to fail a start
-        pass
+        # _register is per-net best effort (a stop signal here used to skip every
+        # net at once); whatever it cannot do, it says so and the record stays
+        _register(child, role, how)
     return child
 
 

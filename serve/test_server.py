@@ -2286,6 +2286,42 @@ class EngineDeath(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_gpu_busy_mid_stream_is_an_in_band_error(self):
+        """A GpuBusy after the SSE headers went out (a give-way retry that ran out of refusals) reaches the client
+        as the API's own in-band error and a properly ended stream: it used to escape to the POST wrapper, whose
+        503 response was written onto the open stream and corrupted it."""
+        class BusyEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield None                              # a prompt-progress heartbeat: the stream has started
+                raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
+                              retry_after=5)
+
+        tok = ByteTokenizer()
+        svc = Service(BusyEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body, marker in [
+                    ("/v1/chat/completions", {"model": "m", "stream": True, "max_tokens": 20,
+                                              "messages": [{"role": "user", "content": "hi"}]}, "[DONE]"),
+                    ("/v1/messages", {"model": "m", "stream": True, "max_tokens": 20,
+                                      "messages": [{"role": "user", "content": "hi"}]}, "event: error"),
+                    ("/v1/responses", {"model": "m", "stream": True, "max_output_tokens": 20,
+                                       "input": [{"role": "user", "content": [{"type": "input_text",
+                                                                               "text": "hi"}]}]},
+                     "response.failed")]:
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    text = r.read().decode()
+                self.assertIn("not free right now", text, path)      # the reason arrives in the stream
+                self.assertIn(marker, text, path)                    # ... and the stream ends properly
+                self.assertNotIn("HTTP/1", text, path)               # no second status line on the wire
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 class DoneLineEngine(MockEngine):
     """The mock engine whose `last` comes from a DONE line, parsed as StrataEngine parses it."""

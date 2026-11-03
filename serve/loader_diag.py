@@ -75,6 +75,12 @@ def missing_files(exe, system_dirs=None) -> list[str]:
         if system_dirs is None:
             root = os.environ.get("SystemRoot") or r"C:\Windows"
             system_dirs = [Path(root) / "System32", Path(root)]
+            # the loader's search order also has the current directory and PATH
+            # (the standard CUDA installer option puts cudart/cublas there):
+            # without them a DLL that loads fine is reported missing, and the
+            # start error sends the user to reinstall what is not missing
+            system_dirs += [Path(d) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+            system_dirs.append(Path.cwd())
         files = [exe] + [p for p in sorted(folder.glob("*.dll"))]
         missing: set[str] = set()
         for f in files:

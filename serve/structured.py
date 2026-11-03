@@ -152,16 +152,9 @@ def prepare_format(response_format, messages, with_tools=False):
     return messages, validator
 
 
-def _extract_json(text: str) -> str:
-    s = (text or "").strip()
-    if not s:
-        return ""
-    if s.startswith("```"):
-        first = s.find("\n")
-        if first != -1:
-            end = s.find("```", first + 1)
-            if end != -1:
-                s = s[first + 1:end].strip()
+def _balanced_object(s: str) -> str:
+    """The first balanced {...} in `s` (string/escape aware), the unbalanced
+    tail from the first { when it never closes, or `s` when it has no {."""
     start = s.find("{")
     if start == -1:
         return s
@@ -189,6 +182,26 @@ def _extract_json(text: str) -> str:
     return s[start:]
 
 
+def _extract_json(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if s.startswith("```"):
+        # the answer wrapped in one fence: cut at the LAST fence, not the
+        # first -- a ``` inside a string value is the value's own (the brace
+        # matcher's string tracking handles it), and the old first-fence cut
+        # truncated the object mid-value, rejecting a valid answer
+        first = s.find("\n")
+        end = s.rfind("```")
+        if first != -1 and end > first:
+            extracted = _balanced_object(s[first + 1:end])
+            if extracted.lstrip().startswith("{"):
+                return extracted
+        # an unterminated fence (or no object inside): brace-match the
+        # whole text, fences and all
+    return _balanced_object(s)
+
+
 def validated_json(text, validator, finish):
     def pairs(items):
         obj = {}
@@ -206,7 +219,7 @@ def validated_json(text, validator, finish):
     try:
         value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
     try:
         error = next(validator.iter_errors(value), None)

@@ -113,7 +113,7 @@ def _arguments(raw, param) -> dict:
         raise ResponsesError("function_call arguments must be a JSON string", param)
     try:
         value = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return {"arguments": raw}
     return value if isinstance(value, dict) else {"arguments": value}
 
@@ -257,6 +257,13 @@ def request_tools(req: dict):
             description = ns_description + ("\n\n" + description if description else "")
         if kind == "function":
             params = tool.get("parameters") or {"type": "object", "properties": {}}
+            if not isinstance(params, dict):
+                # the chat path 400s this shape (#592) before the 200; here it reached
+                # the stream parser instead, whose .get("properties") raised
+                # AttributeError mid-answer - after the generation was paid for
+                raise ResponsesError(
+                    f"{param}: \"parameters\" must be an object (the JSON schema of its "
+                    f"parameters), not {type(params).__name__}", param + ".parameters")
         else:                                        # custom: free-form text, maybe in a grammar the model reads
             fmt = tool.get("format") or {}
             if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):
