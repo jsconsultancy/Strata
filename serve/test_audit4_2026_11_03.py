@@ -99,3 +99,22 @@ def test_end_leftover_engines_still_signatures(monkeypatch):
     with contextlib.redirect_stdout(buf):
         server.end_leftover_engines(r"D:\nonexistent-engine.exe")
     assert "budget" in buf.getvalue()
+
+
+def test_end_leftover_engines_skipped_for_host_spawned_children(monkeypatch):
+    """A server the runtime HOST spawned (STRATA_RUNTIME_PROFILE set) skips
+    the sweep: the host cleaned this profile's recorded leftovers right
+    before spawning, and the scan must not sit inside its startup/rollback
+    wait windows (the rolled_back=False failures on a slow-enumeration
+    machine were exactly that)."""
+    import io
+    import contextlib
+    from strata_control import procs
+    from serve import server
+    monkeypatch.setattr(procs, "orphan_scan_budget", lambda: 0.001)
+    monkeypatch.delenv("STRATA_KEEP_LEFTOVERS", raising=False)
+    monkeypatch.setenv("STRATA_RUNTIME_PROFILE", "local")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        server.end_leftover_engines(r"D:\nonexistent-engine.exe")
+    assert buf.getvalue() == "", "a host-spawned child must not sweep"

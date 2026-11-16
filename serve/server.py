@@ -135,6 +135,15 @@ def end_leftover_engines(exe: str) -> None:
     (the engine waits for the RAM itself and warns; nothing is refused)."""
     if os.environ.get("STRATA_KEEP_LEFTOVERS") == "1":
         return
+    if os.environ.get("STRATA_RUNTIME_PROFILE"):
+        # round 4: a server the runtime HOST spawned. The host cleaned this
+        # profile's recorded leftovers immediately before spawning us
+        # (strata_control/runtime.start), and its startup/rollback wait
+        # windows are tight -- a full-system orphan sweep (best-effort
+        # cleanup that took 47-57 s on a machine whose per-process queries
+        # were slow) must not sit inside a managed start. The sweep runs on
+        # MANUAL server starts, where nothing has cleaned before us.
+        return
     try:
         from strata_control import procs
         say = lambda text: print(text, flush=True)        # noqa: E731
