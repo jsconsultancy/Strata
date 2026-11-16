@@ -364,10 +364,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(mmq_ids_margin_test PRIVATE include)
   add_test(NAME mmq_ids_margin_test COMMAND mmq_ids_margin_test)
 
-  # PR #4844: the adaptive tier's copy-in range across serial, pipelined and drained rounds (header-only, no GPU)
-  add_executable(adaptive_range_test tests/program/adaptive_range_test.cpp)
-  target_include_directories(adaptive_range_test PRIVATE include)
-  add_test(NAME adaptive_range_test COMMAND adaptive_range_test)
+  # #4677: the serve stop bound caps committed rows at what the request can still emit (header-only, no GPU)
+  add_executable(serve_stop_bound_test tests/core/serve_stop_bound_test.cpp)
+  target_include_directories(serve_stop_bound_test PRIVATE include)
+  add_test(NAME serve_stop_bound_test COMMAND serve_stop_bound_test)
+
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
