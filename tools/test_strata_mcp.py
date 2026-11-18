@@ -443,7 +443,27 @@ class Install(FakeRoot):
 
 
 # ------------------------------------------------------------------------------------------------ start / stop / status
+def _a_strata_server_is_live() -> bool:
+    # the StartStop tests assert strata_status sees ONLY their own stub server; a real Strata
+    # serving on this PC (any profile) makes that false by design, so skip rather than fail
+    import urllib.request
+    for port in (8080, 8090):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:  # noqa: BLE001 - a closed port is the expected case
+            pass
+    return False
+
+
 class StartStop(FakeRoot):
+    def setUp(self):
+        if _a_strata_server_is_live():
+            self.skipTest("a real Strata server is live on this PC (its /v1/models answers); "
+                          "the StartStop assertions expect only this test's stub")
+        super().setUp()
+
     def test_start_status_bench_stop(self):
         port = free_port()
         self.write_config("q2_0", port=port, delay=1.5)
